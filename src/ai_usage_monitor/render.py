@@ -5,12 +5,19 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from rich.console import Group
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.progress_bar import ProgressBar
 from rich.table import Table
 from rich.text import Text
 
-from ai_usage_monitor.models import Confidence, ProviderSnapshot, UsageWindow
+from ai_usage_monitor.models import (
+    Confidence,
+    ProviderSnapshot,
+    SourceAttempt,
+    SourceOutcome,
+    UsageWindow,
+)
 
 _PROVIDER_STYLE = {
     "claude": "#d97757",
@@ -21,6 +28,22 @@ _CONFIDENCE_STYLE = {
     Confidence.AUTHORITATIVE: "bold green",
     Confidence.ESTIMATED: "yellow",
     Confidence.UNAVAILABLE: "dim red",
+}
+
+_OUTCOME_STYLE = {
+    SourceOutcome.OK: "bold green",
+    SourceOutcome.EMPTY: "yellow",
+    SourceOutcome.NOT_FOUND: "yellow",
+    SourceOutcome.NO_CREDENTIAL: "dim",
+    SourceOutcome.ERROR: "bold red",
+}
+
+_OUTCOME_MARK = {
+    SourceOutcome.OK: "OK",
+    SourceOutcome.EMPTY: "!",
+    SourceOutcome.NOT_FOUND: "!",
+    SourceOutcome.NO_CREDENTIAL: "-",
+    SourceOutcome.ERROR: "X",
 }
 
 
@@ -99,6 +122,18 @@ def render_snapshot_panel(snapshot: ProviderSnapshot, now: datetime | None = Non
     for error in snapshot.errors:
         parts.append(Text(f"! {error}", style="italic dim"))
 
+    # Partial degradation is the silent case: some sources worked, so there's no error, but a
+    # source did break. When everything failed, the error above already points at doctor.
+    failed = [a for a in snapshot.attempts if not a.ok]
+    if failed and not snapshot.errors:
+        parts.append(
+            Text(
+                f"{len(failed)}/{len(snapshot.attempts)} source(s) unavailable -- "
+                f"run `ai-usage-monitor doctor --provider {snapshot.provider}`",
+                style="italic dim",
+            )
+        )
+
     return Panel(
         Group(*parts),
         title=f"[bold]{snapshot.provider.upper()}[/bold]",
@@ -108,10 +143,69 @@ def render_snapshot_panel(snapshot: ProviderSnapshot, now: datetime | None = Non
     )
 
 
+def _attempt_lines(attempt: SourceAttempt) -> list:
+    mark = _OUTCOME_MARK[attempt.outcome]
+    style = _OUTCOME_STYLE[attempt.outcome]
+
+    head = Text()
+    head.append(f"[{mark}] ", style=style)
+    head.append(attempt.name, style="bold")
+    head.append(f"  {attempt.outcome.value}", style=style)
+    head.append(f"  ({attempt.duration_ms:.0f}ms)", style="dim")
+
+    # Padding (rather than literal spaces) so wrapped continuation lines stay indented too.
+    lines = [head, Padding(Text(attempt.detail, style="dim"), (0, 0, 0, 6))]
+    if attempt.remediation:
+        lines.append(Padding(Text(f"-> {attempt.remediation}", style="cyan"), (0, 0, 0, 6)))
+    return lines
+
+
+def render_doctor_panel(snapshot: ProviderSnapshot) -> Panel:
+    """Per-source diagnostic report: what we tried, how it went, what to do about it."""
+    style = _PROVIDER_STYLE.get(snapshot.provider, "white")
+
+    parts: list = []
+    if snapshot.attempts:
+        for index, attempt in enumerate(snapshot.attempts):
+            if index:
+                parts.append(Text(""))
+            parts.extend(_attempt_lines(attempt))
+    else:
+        parts.append(Text("no sources were attempted", style="dim"))
+
+    ok_count = sum(1 for a in snapshot.attempts if a.ok)
+    parts.append(Text(""))
+    parts.append(
+        Text(
+            f"{ok_count}/{len(snapshot.attempts)} source(s) healthy; overall status: "
+            f"{snapshot.status.value}",
+            style=_CONFIDENCE_STYLE[snapshot.status],
+        )
+    )
+
+    return Panel(
+        Group(*parts),
+        title=f"[bold]{snapshot.provider.upper()}[/bold] sources",
+        border_style=style,
+        title_align="left",
+    )
+
+
+def attempt_to_dict(attempt: SourceAttempt) -> dict:
+    return {
+        "name": attempt.name,
+        "outcome": attempt.outcome.value,
+        "detail": attempt.detail,
+        "duration_ms": round(attempt.duration_ms, 3),
+        "remediation": attempt.remediation,
+    }
+
+
 def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict:
     return {
         "provider": snapshot.provider,
         "fetched_at": snapshot.fetched_at.isoformat(),
+        "status": snapshot.status.value,
         "windows": [
             {
                 "label": w.label,
@@ -126,5 +220,6 @@ def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict:
             }
             for w in snapshot.windows
         ],
+        "attempts": [attempt_to_dict(a) for a in snapshot.attempts],
         "errors": snapshot.errors,
     }

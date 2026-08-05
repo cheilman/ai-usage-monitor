@@ -29,7 +29,33 @@ ai-usage-monitor snapshot --provider claude
 # live btop-style dashboard, refreshing every 5s
 ai-usage-monitor dashboard
 ai-usage-monitor dashboard --interval 2
+
+# why is a number missing? show every source tried, per provider
+ai-usage-monitor doctor
+ai-usage-monitor doctor --provider gemini --json
 ```
+
+## Diagnosing missing numbers
+
+Every source this tool reads is an undocumented internal format or an unpublished endpoint, so
+sources break. `doctor` reports each one it tried with an outcome (`ok`, `empty`, `not_found`,
+`no_credential`, `error`), the detail behind it, how long it took, and what to do about it:
+
+```
+╭─ CLAUDE sources ──────────────────────────────────────────────────────────╮
+│ [-] anthropic live rate-limit headers  no_credential  (0ms)               │
+│       ANTHROPIC_API_KEY is not set                                        │
+│       -> Export ANTHROPIC_API_KEY to see live API rate limits. ...        │
+│                                                                           │
+│ [OK] claude code JSONL transcripts  ok  (2ms)                             │
+│       1 usage records across 1 transcript file(s)                         │
+│                                                                           │
+│ 1/2 source(s) healthy; overall status: estimated                          │
+╰───────────────────────────────────────────────────────────────────────────╯
+```
+
+It exits non-zero if any selected provider has no healthy source, so it's usable as a check in
+scripts. The same attempts appear in the `attempts` array of any `--json` output.
 
 ## Config
 

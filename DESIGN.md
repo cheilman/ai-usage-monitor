@@ -47,12 +47,33 @@ this tool. Every `UsageWindow` carries a `confidence` field
 (human or script) can tell live-API data from best-effort log scraping from "we don't know" —
 see `src/ai_usage_monitor/models.py`.
 
+## Source attempts and `doctor`
+
+Confidence flags say how good a number is, but not why a number is *missing*. Since every
+source here will eventually break, each provider records a `SourceAttempt(name, outcome,
+detail, duration_ms, remediation)` for **every** source it tries, successful or not, in
+`ProviderSnapshot.attempts`. Outcomes are `ok` / `empty` / `not_found` / `no_credential` /
+`error`, and a source that raises unexpectedly is caught and downgraded to an `error` attempt
+rather than taking the whole snapshot down (`providers/base.py:run_source`).
+
+`ai-usage-monitor doctor` prints that trail per provider with a remediation line, and exits
+non-zero when a provider has no healthy source. The distinction that matters most is
+`not_found` (never used / wrong path) versus `empty` (the file is there but carries no records
+we recognise) — the latter is what schema drift looks like from the outside, and previously
+both just rendered as "no data".
+
+`ProviderSnapshot.errors` is reserved for genuine, provider-level failures — "nothing worked at
+all" — rather than per-source explanations, which now live in `attempts`.
+
 ## Layout
 
-- `providers/claude.py`, `providers/gemini.py` — one `fetch() -> ProviderSnapshot` per provider.
+- `providers/claude.py`, `providers/gemini.py` — one `fetch() -> ProviderSnapshot` per provider,
+  each running an ordered chain of sources through `run_source`.
+- `providers/base.py` — the `UsageProvider` protocol and `run_source`, which times one source
+  and turns its result (or its exception) into a `SourceAttempt`.
 - `config.py` — optional `~/.config/ai-usage-monitor/config.toml` for plan caps that aren't
   discoverable programmatically.
-- `render.py` — shared rendering (rich panels + JSON) used by both CLI modes, so snapshot and
-  dashboard never drift apart.
-- `cli.py` — `snapshot` (default, supports `--json`) and `dashboard` (live, `rich.Live`)
-  subcommands.
+- `render.py` — shared rendering (rich panels + JSON) used by all CLI modes, so snapshot,
+  dashboard, and doctor never drift apart.
+- `cli.py` — `snapshot` (default, supports `--json`), `doctor` (per-source diagnostics), and
+  `dashboard` (live, `rich.Live`) subcommands.

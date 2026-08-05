@@ -1,8 +1,17 @@
 """Claude usage provider.
 
-Anthropic does not publish a "get my subscription usage" API. Two signals are combined:
+Anthropic does not publish a "get my subscription usage" API. Two signals are combined, in
+this order, and each one records a SourceAttempt whether it works or not (`ai-usage-monitor
+doctor` prints those attempts -- both sources here read undocumented surfaces that will
+eventually change, and an attempt list is what makes that visible instead of silent):
 
-1. Local transcript scraping (primary, works for Claude Code Pro/Max/Team subscriptions).
+1. Live Anthropic API rate-limit headers (only if ANTHROPIC_API_KEY is set).
+   Every API response carries anthropic-ratelimit-{requests,tokens}-{limit,remaining,reset}
+   headers. These are authoritative but describe API-key rate limits, not the Claude Code
+   subscription session window, so they're reported as a separate window. We use the free
+   /v1/messages/count_tokens endpoint to trigger them without spending completion tokens.
+
+2. Local transcript scraping (the subscription signal, for Claude Code Pro/Max/Team).
    Claude Code writes one JSONL file per session under ~/.claude/projects/<project>/*.jsonl,
    one JSON object per line, with token counts in `message.usage`. We sum tokens inside the
    active rolling session block (mirrors the community `ccusage` tool's approach: a new block
@@ -11,12 +20,6 @@ Anthropic does not publish a "get my subscription usage" API. Two signals are co
    read programmatically, so `limit` comes from user config and defaults to None ("unavailable")
    -- this is the fallback this task's design notes asked to flag explicitly as fragile: it
    breaks silently if Anthropic changes the JSONL schema or storage location.
-
-2. Live Anthropic API rate-limit headers (secondary, only if ANTHROPIC_API_KEY is set).
-   Every API response carries anthropic-ratelimit-{requests,tokens}-{limit,remaining,reset}
-   headers. These are authoritative but describe API-key rate limits, not the Claude Code
-   subscription session window, so they're reported as a separate window. We use the free
-   /v1/messages/count_tokens endpoint to trigger them without spending completion tokens.
 """
 
 from __future__ import annotations
@@ -29,10 +32,19 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ai_usage_monitor.config import ClaudeConfig
-from ai_usage_monitor.models import Confidence, ProviderSnapshot, UsageWindow
+from ai_usage_monitor.models import (
+    Confidence,
+    ProviderSnapshot,
+    SourceOutcome,
+    UsageWindow,
+)
+from ai_usage_monitor.providers.base import SourceResult, run_source
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages/count_tokens"
 ANTHROPIC_VERSION = "2023-06-01"
+
+LIVE_API_SOURCE = "anthropic live rate-limit headers"
+TRANSCRIPTS_SOURCE = "claude code JSONL transcripts"
 
 
 @dataclass
@@ -111,12 +123,19 @@ def _trailing_sum(events: list[_Event], since: datetime) -> int:
     return sum(e.tokens for e in events if e.timestamp >= since)
 
 
-def _probe_live_api_limits(now: datetime) -> UsageWindow | None:
+def _probe_live_api_limits() -> SourceResult:
+    """Source 1: live API key rate-limit headers (authoritative, but API-key scoped)."""
     import os
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        return None
+        return (
+            [],
+            SourceOutcome.NO_CREDENTIAL,
+            "ANTHROPIC_API_KEY is not set",
+            "Export ANTHROPIC_API_KEY to see live API rate limits. Not needed for "
+            "Claude Code subscription usage, which comes from local transcripts.",
+        )
 
     body = json.dumps(
         {
@@ -134,22 +153,46 @@ def _probe_live_api_limits(now: datetime) -> UsageWindow | None:
             "content-type": "application/json",
         },
     )
+    status: int | None = None
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             headers = response.headers
+            status = response.status
     except urllib.error.HTTPError as exc:
+        # 4xx responses still carry rate-limit headers, so they're worth reading.
         headers = exc.headers
-    except (urllib.error.URLError, TimeoutError):
-        return None
+        status = exc.code
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return (
+            [],
+            SourceOutcome.ERROR,
+            f"could not reach {ANTHROPIC_API_URL}: {exc}",
+            "Check network access and any proxy settings for api.anthropic.com.",
+        )
+
+    if status in (401, 403):
+        return (
+            [],
+            SourceOutcome.ERROR,
+            f"HTTP {status} from {ANTHROPIC_API_URL} -- key rejected",
+            "ANTHROPIC_API_KEY looks invalid, expired, or revoked. Re-issue it at "
+            "console.anthropic.com and re-export it.",
+        )
 
     limit = headers.get("anthropic-ratelimit-tokens-limit")
     remaining = headers.get("anthropic-ratelimit-tokens-remaining")
     reset = headers.get("anthropic-ratelimit-tokens-reset")
     if limit is None or remaining is None:
-        return None
+        return (
+            [],
+            SourceOutcome.EMPTY,
+            f"HTTP {status} but no anthropic-ratelimit-tokens-* headers on the response",
+            "The endpoint answered without rate-limit headers; Anthropic may have "
+            "changed or dropped them. This source needs updating.",
+        )
 
     reset_at = _parse_timestamp(reset) if reset else None
-    return UsageWindow(
+    window = UsageWindow(
         label="API tokens/min (live key)",
         unit="tokens",
         used=float(limit) - float(remaining),
@@ -158,6 +201,87 @@ def _probe_live_api_limits(now: datetime) -> UsageWindow | None:
         confidence=Confidence.AUTHORITATIVE,
         source="anthropic-ratelimit-tokens-* response headers",
     )
+    return [window], SourceOutcome.OK, f"HTTP {status}, tokens limit {limit}", None
+
+
+def _read_transcripts(config: ClaudeConfig, now: datetime) -> SourceResult:
+    """Source 2: local Claude Code JSONL transcripts (the subscription-usage signal)."""
+    data_dir = config.data_dir
+    if not data_dir.exists():
+        return (
+            [],
+            SourceOutcome.NOT_FOUND,
+            f"{data_dir} does not exist",
+            "Run Claude Code at least once, or point CLAUDE_CONFIG_DIR at the home "
+            "directory that holds your .claude/projects.",
+        )
+
+    transcript_count = sum(1 for _ in data_dir.rglob("*.jsonl"))
+    events = _iter_events(data_dir)
+    if not events:
+        # Files but no parseable usage records is the interesting case: that's what schema
+        # drift looks like from here, and it's indistinguishable from "never used" without
+        # the file count.
+        detail = (
+            f"{transcript_count} transcript file(s) under {data_dir}, but no records with "
+            "a timestamp and message.usage"
+            if transcript_count
+            else f"no *.jsonl transcripts under {data_dir}"
+        )
+        remediation = (
+            "Transcripts exist but carry no usage data -- Claude Code's JSONL schema may "
+            "have changed. This source needs updating."
+            if transcript_count
+            else "Run Claude Code at least once so it writes a session transcript."
+        )
+        return [], SourceOutcome.EMPTY, detail, remediation
+
+    windows: list[UsageWindow] = []
+    window = timedelta(hours=config.session_window_hours)
+    block_start, block_tokens = _current_block(events, window)
+    reset_at = block_start + window if block_start else None
+    windows.append(
+        UsageWindow(
+            label=f"{config.session_window_hours:g}h session tokens",
+            unit="tokens",
+            used=float(block_tokens),
+            limit=float(config.session_token_limit) if config.session_token_limit else None,
+            reset_at=reset_at,
+            confidence=Confidence.ESTIMATED
+            if config.session_token_limit
+            else Confidence.UNAVAILABLE,
+            source="local JSONL transcript scrape (~/.claude/projects)",
+            note=None
+            if config.session_token_limit
+            else "cap not published by Anthropic; set claude.session_token_limit in config",
+        )
+    )
+
+    week_ago = now - timedelta(days=7)
+    weekly_tokens = _trailing_sum(events, week_ago)
+    windows.append(
+        UsageWindow(
+            label="7d rolling tokens",
+            unit="tokens",
+            used=float(weekly_tokens),
+            limit=float(config.weekly_token_limit) if config.weekly_token_limit else None,
+            reset_at=None,
+            confidence=Confidence.ESTIMATED
+            if config.weekly_token_limit
+            else Confidence.UNAVAILABLE,
+            source="local JSONL transcript scrape (~/.claude/projects)",
+            note="weekly reset anchor is account-specific and not exposed locally",
+        )
+    )
+
+    remediation = None
+    if not (config.session_token_limit and config.weekly_token_limit):
+        remediation = (
+            "Usage is readable but plan caps are not published by Anthropic; set "
+            "claude.session_token_limit / claude.weekly_token_limit in config for percentages."
+        )
+    detail = f"{len(events)} usage records across {transcript_count} transcript file(s)"
+    return windows, SourceOutcome.OK, detail, remediation
 
 
 class ClaudeProvider:
@@ -170,56 +294,22 @@ class ClaudeProvider:
         now = datetime.now(UTC)
         snapshot = ProviderSnapshot(provider=self.name, fetched_at=now)
 
-        events = _iter_events(self.config.data_dir)
-        if not events:
+        # Ordered chain: live API first (authoritative where it applies), then local
+        # transcripts. Both are tried every time -- they describe different limits, so a
+        # hit on one doesn't make the other redundant.
+        chain = [
+            (LIVE_API_SOURCE, _probe_live_api_limits),
+            (TRANSCRIPTS_SOURCE, lambda: _read_transcripts(self.config, now)),
+        ]
+        for source_name, source_fn in chain:
+            windows, attempt = run_source(source_name, source_fn)
+            snapshot.attempts.append(attempt)
+            snapshot.windows.extend(windows)
+
+        if not snapshot.windows:
             snapshot.errors.append(
-                f"No Claude Code session transcripts found under {self.config.data_dir}. "
-                "Run Claude Code at least once, or point CLAUDE_CONFIG_DIR at the right home."
+                "No Claude usage available: every source failed. "
+                "Run `ai-usage-monitor doctor --provider claude` for per-source detail."
             )
-        else:
-            window = timedelta(hours=self.config.session_window_hours)
-            block_start, block_tokens = _current_block(events, window)
-            reset_at = block_start + window if block_start else None
-            snapshot.windows.append(
-                UsageWindow(
-                    label=f"{self.config.session_window_hours:g}h session tokens",
-                    unit="tokens",
-                    used=float(block_tokens),
-                    limit=float(self.config.session_token_limit)
-                    if self.config.session_token_limit
-                    else None,
-                    reset_at=reset_at,
-                    confidence=Confidence.ESTIMATED
-                    if self.config.session_token_limit
-                    else Confidence.UNAVAILABLE,
-                    source="local JSONL transcript scrape (~/.claude/projects)",
-                    note=None
-                    if self.config.session_token_limit
-                    else "cap not published by Anthropic; set claude.session_token_limit in config",
-                )
-            )
-
-            week_ago = now - timedelta(days=7)
-            weekly_tokens = _trailing_sum(events, week_ago)
-            snapshot.windows.append(
-                UsageWindow(
-                    label="7d rolling tokens",
-                    unit="tokens",
-                    used=float(weekly_tokens),
-                    limit=float(self.config.weekly_token_limit)
-                    if self.config.weekly_token_limit
-                    else None,
-                    reset_at=None,
-                    confidence=Confidence.ESTIMATED
-                    if self.config.weekly_token_limit
-                    else Confidence.UNAVAILABLE,
-                    source="local JSONL transcript scrape (~/.claude/projects)",
-                    note="weekly reset anchor is account-specific and not exposed locally",
-                )
-            )
-
-        live_window = _probe_live_api_limits(now)
-        if live_window:
-            snapshot.windows.append(live_window)
 
         return snapshot
