@@ -30,12 +30,18 @@ class UsageWindow:
     confidence: Confidence
     source: str
     note: str | None = None
+    # Provider-computed extras. Only sources that publish them (today: Claude's
+    # /api/oauth/usage `limits[]`) fill these in; everything else leaves the defaults.
+    is_active: bool = False
+    severity: str | None = None
 
     @property
     def percent(self) -> float | None:
         if self.used is None or not self.limit:
             return None
-        return max(0.0, min(100.0, (self.used / self.limit) * 100.0))
+        # Rounded so an already-normalized percentage (used=14, limit=100) round-trips as
+        # 14.0 rather than 14.000000000000002 in --json output.
+        return round(max(0.0, min(100.0, (self.used / self.limit) * 100.0)), 6)
 
 
 @dataclass
@@ -46,3 +52,7 @@ class ProviderSnapshot:
     fetched_at: datetime
     windows: list[UsageWindow] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Plan identifier when the provider tells us one (e.g. "pro", "max"), else None.
+    plan: str | None = None
+    # Non-error side facts worth showing, e.g. extra-usage credits or period spend.
+    notes: list[str] = field(default_factory=list)

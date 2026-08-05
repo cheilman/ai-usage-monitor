@@ -23,6 +23,13 @@ _CONFIDENCE_STYLE = {
     Confidence.UNAVAILABLE: "dim red",
 }
 
+# Provider-reported severity, when the source publishes one (Claude's limits[]).
+_SEVERITY_STYLE = {
+    "normal": "green",
+    "warning": "yellow",
+    "critical": "bold red",
+}
+
 
 def _format_countdown(reset_at: datetime | None, now: datetime) -> str:
     if reset_at is None:
@@ -31,8 +38,11 @@ def _format_countdown(reset_at: datetime | None, now: datetime) -> str:
     seconds = int(delta.total_seconds())
     if seconds <= 0:
         return "resetting..."
-    hours, remainder = divmod(seconds, 3600)
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
     minutes, secs = divmod(remainder, 60)
+    if days:
+        return f"{days}d{hours:02d}h"
     if hours:
         return f"{hours}h{minutes:02d}m"
     if minutes:
@@ -58,9 +68,12 @@ def _window_row(window: UsageWindow, now: datetime) -> tuple[str, ...]:
     pct = window.percent
     pct_str = f"{pct:.0f}%" if pct is not None else "-"
 
+    # A percent-unit window is already fully described by the percentage column.
+    detail = "" if window.unit == "percent" else f"{used_str} / {limit_str} {window.unit}"
+
     return (
-        window.label,
-        f"{used_str} / {limit_str} {window.unit}",
+        f"{window.label} *" if window.is_active else window.label,
+        detail,
         pct_str,
         _format_countdown(window.reset_at, now),
         Text(window.confidence.value, style=_CONFIDENCE_STYLE[window.confidence]),
@@ -87,7 +100,7 @@ def render_snapshot_panel(snapshot: ProviderSnapshot, now: datetime | None = Non
                 bar = ProgressBar(
                     total=100,
                     completed=pct,
-                    complete_style=style,
+                    complete_style=_SEVERITY_STYLE.get(window.severity or "", style),
                     finished_style="bold red",
                     width=None,
                 )
@@ -96,12 +109,19 @@ def render_snapshot_panel(snapshot: ProviderSnapshot, now: datetime | None = Non
     else:
         parts.append(Text("no data", style="dim"))
 
+    for note in snapshot.notes:
+        parts.append(Text(note, style="dim"))
+
     for error in snapshot.errors:
         parts.append(Text(f"! {error}", style="italic dim"))
 
+    title = f"[bold]{snapshot.provider.upper()}[/bold]"
+    if snapshot.plan:
+        title += f" [dim]plan: {snapshot.plan}[/dim]"
+
     return Panel(
         Group(*parts),
-        title=f"[bold]{snapshot.provider.upper()}[/bold]",
+        title=title,
         border_style=style,
         subtitle=f"as of {now.strftime('%H:%M:%S UTC')}",
         subtitle_align="right",
@@ -112,6 +132,7 @@ def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict:
     return {
         "provider": snapshot.provider,
         "fetched_at": snapshot.fetched_at.isoformat(),
+        "plan": snapshot.plan,
         "windows": [
             {
                 "label": w.label,
@@ -123,8 +144,11 @@ def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict:
                 "confidence": w.confidence.value,
                 "source": w.source,
                 "note": w.note,
+                "is_active": w.is_active,
+                "severity": w.severity,
             }
             for w in snapshot.windows
         ],
+        "notes": snapshot.notes,
         "errors": snapshot.errors,
     }
