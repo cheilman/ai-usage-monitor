@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ai-usage-monitor"
-version = "0.1.0"
+dynamic = ["version"]
 description = "CLI usage monitor for Claude and Gemini plan/session limits"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,6 +15,9 @@ dependencies = [
 
 [project.scripts]
 ai-usage-monitor = "ai_usage_monitor.cli:main"
+
+[tool.hatch.version]
+path = "src/ai_usage_monitor/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ai_usage_monitor"]
