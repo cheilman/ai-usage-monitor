@@ -47,12 +47,35 @@ this tool. Every `UsageWindow` carries a `confidence` field
 (human or script) can tell live-API data from best-effort log scraping from "we don't know" —
 see `src/ai_usage_monitor/models.py`.
 
+## Caching
+
+Every source we read is either an undocumented endpoint or someone else's local log format, and
+the dashboard re-reads them on a timer. So snapshots go through an on-disk cache
+(`~/.cache/ai-usage-monitor/snapshot.json`, 60s default TTL, `--max-age S` / `--no-cache` to
+override), keyed by provider so a single-provider run doesn't invalidate the other's data.
+
+The accuracy cost is ~zero: a rolling 5-hour window, a 7-day window and a daily request count
+do not meaningfully change in 60 seconds. The benefit is that leaving the dashboard open no
+longer means one request per provider every refresh — with the default 30s interval and 60s
+max-age it's one round of requests per minute regardless of how fast the screen redraws.
+
+Cache failures are always *misses*, never errors: an unreadable, truncated, hand-mangled or
+future-versioned file just triggers a live fetch (and gets overwritten with a good one). Writes
+are atomic (temp file + `os.replace`) and best-effort — an unwritable cache dir must not break
+the tool. The stored payload is exactly `snapshot_to_dict` output, which contains no
+credentials, because `ProviderSnapshot` has nowhere to put one.
+
+Because cached data is by definition not "now", the panel footer reports the snapshot's own
+`fetched_at` plus an age (`as of 09:15:02 UTC (43s ago)`) rather than the redraw time.
+
 ## Layout
 
 - `providers/claude.py`, `providers/gemini.py` — one `fetch() -> ProviderSnapshot` per provider.
+- `cache.py` — TTL'd on-disk snapshot cache plus `fetch_snapshots()`, the single read-through
+  entry point both CLI modes use.
 - `config.py` — optional `~/.config/ai-usage-monitor/config.toml` for plan caps that aren't
   discoverable programmatically.
-- `render.py` — shared rendering (rich panels + JSON) used by both CLI modes, so snapshot and
-  dashboard never drift apart.
+- `render.py` — shared rendering (rich panels + JSON) and the snapshot (de)serializer used by
+  both CLI modes and the cache, so snapshot and dashboard never drift apart.
 - `cli.py` — `snapshot` (default, supports `--json`) and `dashboard` (live, `rich.Live`)
   subcommands.

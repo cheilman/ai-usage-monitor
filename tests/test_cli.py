@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 
+from ai_usage_monitor.cli import build_parser
+
 
 def test_snapshot_json_smoke(tmp_path):
     env = {
@@ -23,3 +25,26 @@ def test_snapshot_json_smoke(tmp_path):
     payload = json.loads(result.stdout)
     providers = {entry["provider"] for entry in payload}
     assert providers == {"claude", "gemini"}
+
+
+def test_cache_flags_available_on_every_entry_point():
+    """snapshot, dashboard, and the bare no-subcommand form must all accept the cache flags."""
+    parser = build_parser()
+
+    for argv in ([], ["snapshot"], ["dashboard"]):
+        args = parser.parse_args(argv)
+        assert args.max_age == 60.0
+        assert args.no_cache is False
+
+        overridden = parser.parse_args([*argv, "--max-age", "5", "--no-cache"])
+        assert overridden.max_age == 5.0
+        assert overridden.no_cache is True
+
+
+def test_dashboard_interval_default_is_30s():
+    """Paired with the 60s cache TTL: two ticks per round of provider requests."""
+    assert parser_default("dashboard", "interval") == 30.0
+
+
+def parser_default(command: str, attr: str):
+    return getattr(build_parser().parse_args([command]), attr)

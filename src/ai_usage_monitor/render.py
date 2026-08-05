@@ -17,6 +17,9 @@ _PROVIDER_STYLE = {
     "gemini": "#4285f4",
 }
 
+# Below this, "as of HH:MM:SS" is close enough to now that calling out the age is just noise.
+_STALE_AFTER_SECONDS = 5
+
 _CONFIDENCE_STYLE = {
     Confidence.AUTHORITATIVE: "bold green",
     Confidence.ESTIMATED: "yellow",
@@ -103,12 +106,25 @@ def render_snapshot_panel(snapshot: ProviderSnapshot, now: datetime | None = Non
         Group(*parts),
         title=f"[bold]{snapshot.provider.upper()}[/bold]",
         border_style=style,
-        subtitle=f"as of {now.strftime('%H:%M:%S UTC')}",
+        subtitle=_subtitle(snapshot, now),
         subtitle_align="right",
     )
 
 
+def _subtitle(snapshot: ProviderSnapshot, now: datetime) -> str:
+    """When the *data* is from, not when we drew it -- with the cache in play those differ."""
+    fetched = snapshot.fetched_at.astimezone(UTC)
+    text = f"as of {fetched.strftime('%H:%M:%S UTC')}"
+    age = int((now - fetched).total_seconds())
+    if age >= _STALE_AFTER_SECONDS:
+        text += f" ({age}s ago)"
+    return text
+
+
 def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict:
+    """Serialize a snapshot. Note this only ever emits usage numbers and labels -- API keys
+    and OAuth tokens are not part of the model, so `--json` output and the on-disk cache
+    (see cache.py) are both safe to write to a file or hand to another process."""
     return {
         "provider": snapshot.provider,
         "fetched_at": snapshot.fetched_at.isoformat(),
@@ -128,3 +144,38 @@ def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict:
         ],
         "errors": snapshot.errors,
     }
+
+
+def _parse_iso(raw: str | None) -> datetime | None:
+    return datetime.fromisoformat(raw) if raw else None
+
+
+def snapshot_from_dict(payload: dict) -> ProviderSnapshot:
+    """Inverse of `snapshot_to_dict`, for reading cached snapshots back.
+
+    Deliberately strict: anything malformed raises (TypeError/ValueError/KeyError) rather than
+    silently producing a half-empty snapshot, so the cache layer can treat it as a miss and
+    fetch live instead. The derived `percent` field is recomputed, not read back.
+    """
+    fetched_at = _parse_iso(payload["fetched_at"])
+    if fetched_at is None:
+        raise ValueError("snapshot payload has no fetched_at")
+
+    return ProviderSnapshot(
+        provider=payload["provider"],
+        fetched_at=fetched_at,
+        windows=[
+            UsageWindow(
+                label=w["label"],
+                unit=w["unit"],
+                used=w["used"],
+                limit=w["limit"],
+                reset_at=_parse_iso(w["reset_at"]),
+                confidence=Confidence(w["confidence"]),
+                source=w["source"],
+                note=w["note"],
+            )
+            for w in payload["windows"]
+        ],
+        errors=list(payload["errors"]),
+    )
