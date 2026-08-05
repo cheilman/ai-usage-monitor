@@ -36,6 +36,9 @@ ai-usage-monitor snapshot
 # machine-readable, for scripts/other agents
 ai-usage-monitor --json
 
+# non-zero exit unless *every* provider is reporting authoritatively
+ai-usage-monitor --json --fail-on-degraded
+
 # just one provider
 ai-usage-monitor snapshot --provider claude
 
@@ -43,6 +46,99 @@ ai-usage-monitor snapshot --provider claude
 ai-usage-monitor dashboard
 ai-usage-monitor dashboard --interval 2
 ```
+
+## JSON contract (`schema_version` 1)
+
+`--json` emits a versioned envelope, not a bare array. It is a stable interface: fields are
+added compatibly, and anything that breaks a consumer bumps `schema_version`. Parse
+defensively — refuse a `schema_version` you don't recognize rather than guessing.
+
+```json
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-05T02:45:28.104913+00:00",
+  "providers": [
+    {
+      "provider": "claude",
+      "status": "ok",
+      "fetched_at": "2026-08-05T02:45:28.104110+00:00",
+      "plan": "pro",
+      "windows": [
+        {
+          "key": "five_hour",
+          "label": "5-hour session",
+          "unit": "percent",
+          "used": 21.0,
+          "limit": 100.0,
+          "percent": 21.0,
+          "reset_at": "2026-08-05T07:20:00.628697+00:00",
+          "confidence": "authoritative",
+          "source": "GET /api/oauth/usage (Claude Code OAuth token)",
+          "note": null,
+          "is_active": false,
+          "severity": "normal"
+        }
+      ],
+      "notes": [],
+      "errors": []
+    }
+  ],
+  "most_constrained": {
+    "provider": "claude",
+    "key": "weekly_all",
+    "label": "Weekly (all models)",
+    "utilization_pct": 54.0,
+    "resets_at": "2026-08-06T00:00:00.628717+00:00"
+  }
+}
+```
+
+### `most_constrained`
+
+The single window closest to its cap across every provider, so a throttling caller is one
+lookup rather than a reimplementation of the precedence rules. Highest utilization wins; ties
+go to the better `confidence`, then to provider/key alphabetically, so the answer is
+deterministic. Windows with an unknown percentage, and windows marked `unavailable`, are not
+candidates.
+
+> `most_constrained` is `null` when **nothing** is known. That means quota is *unknown* — it
+> does **not** mean quota is available. Treat `null` as a reason to back off or to check
+> another way, never as a green light.
+
+### `key` vs `label`
+
+Match on `key`. It's a stable machine identifier, unique within a provider; `label` is display
+prose and may be reworded at any time. Claude spells its 5-hour window `session` in one part
+of the upstream payload and `five_hour` in another — both normalize onto `five_hour`, so the
+key holds whichever branch produced the row.
+
+| Provider | `key` | Window |
+| -------- | ----- | ------ |
+| claude | `five_hour` | rolling 5-hour session utilization |
+| claude | `weekly_all` | rolling weekly utilization, all models |
+| claude | `weekly_opus` / `weekly_sonnet` | per-model weekly utilization |
+| claude | `*_dollars` | the same windows in dollars, on credit/overage plans |
+| claude | `session_tokens` / `weekly_tokens` | **fallback only** — raw transcript token counts against a hand-configured cap, deliberately *not* keyed as the authoritative windows |
+| claude | `api_tokens_per_minute` | `ANTHROPIC_API_KEY` rate limit — a different thing from subscription usage |
+| gemini | `daily_requests` / `daily_tokens` | today's requests / tokens |
+
+An unrecognized upstream window kind gets a slugified key rather than being dropped, so a new
+plan shape shows up as an extra row.
+
+### Provider `status` and exit codes
+
+| `status` | Meaning |
+| -------- | ------- |
+| `ok` | at least one authoritative window, and nothing in the source chain failed |
+| `degraded` | usable numbers, but from a fallback or a driftable estimate |
+| `unavailable` | no usable window at all — quota unknown |
+
+| Exit | Condition |
+| ---- | --------- |
+| `0` | at least one provider is `ok` |
+| `2` | no provider is `ok` — or, with `--fail-on-degraded`, any provider isn't |
+
+So `ai-usage-monitor --json || back_off` is a valid gate on its own, without parsing.
 
 ## Where the numbers come from
 

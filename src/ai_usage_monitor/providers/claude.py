@@ -57,23 +57,33 @@ OAUTH_BETA = "oauth-2025-04-20"
 OAUTH_SOURCE = "GET /api/oauth/usage (Claude Code OAuth token)"
 TRANSCRIPT_SOURCE = "local JSONL transcript scrape (fallback; ~/.claude/projects)"
 
-# limits[].kind -> display label. Unknown kinds fall back to a prettified kind string, so a
-# new plan shape shows up as an extra row rather than vanishing.
-_LIMIT_LABELS = {
-    "session": "5-hour session",
-    "five_hour": "5-hour session",
-    "weekly_all": "Weekly (all models)",
-    "weekly_opus": "Weekly (Opus)",
-    "weekly_sonnet": "Weekly (Sonnet)",
+# limits[].kind -> (stable --json key, display label). Anthropic spells the same window two
+# ways depending on which part of the payload you read (`session` in limits[], `five_hour` as
+# a top-level block), so both normalize onto one key: a consumer keying off `five_hour` keeps
+# working whichever branch produced the window. Unknown kinds fall back to a slugified kind,
+# so a new plan shape shows up as an extra row rather than vanishing.
+_LIMIT_WINDOWS = {
+    "session": ("five_hour", "5-hour session"),
+    "five_hour": ("five_hour", "5-hour session"),
+    "weekly_all": ("weekly_all", "Weekly (all models)"),
+    "weekly_opus": ("weekly_opus", "Weekly (Opus)"),
+    "weekly_sonnet": ("weekly_sonnet", "Weekly (Sonnet)"),
 }
 
-# Named top-level keys, used only when limits[] is missing/empty.
+# Named top-level payload keys -> (stable --json key, display label). Used only when
+# limits[] is missing/empty.
 _NAMED_WINDOWS = (
-    ("five_hour", "5-hour session"),
-    ("seven_day", "Weekly (all models)"),
-    ("seven_day_opus", "Weekly (Opus)"),
-    ("seven_day_sonnet", "Weekly (Sonnet)"),
+    ("five_hour", "five_hour", "5-hour session"),
+    ("seven_day", "weekly_all", "Weekly (all models)"),
+    ("seven_day_opus", "weekly_opus", "Weekly (Opus)"),
+    ("seven_day_sonnet", "weekly_sonnet", "Weekly (Sonnet)"),
 )
+
+
+def _slug(value: str) -> str:
+    """Machine key for a window kind we don't have a mapping for yet."""
+    cleaned = "".join(char if char.isalnum() else "_" for char in value.lower())
+    return "_".join(part for part in cleaned.split("_") if part) or "usage"
 
 
 class UsageSourceError(RuntimeError):
@@ -152,6 +162,7 @@ def fetch_oauth_usage(credential: OAuthCredential, timeout: float = 10.0) -> dic
 
 
 def _percent_window(
+    key: str,
     label: str,
     percent: float,
     resets_at: object,
@@ -161,6 +172,7 @@ def _percent_window(
 ) -> UsageWindow:
     """Utilization is already normalized against the plan cap, so limit is a literal 100%."""
     return UsageWindow(
+        key=key,
         label=label,
         unit="percent",
         used=percent,
@@ -187,9 +199,11 @@ def _windows_from_limits(payload: dict) -> list[UsageWindow]:
             continue
         kind = str(entry.get("kind") or entry.get("group") or "usage")
         severity = entry.get("severity")
+        key, label = _LIMIT_WINDOWS.get(kind, (_slug(kind), kind.replace("_", " ").capitalize()))
         windows.append(
             _percent_window(
-                _LIMIT_LABELS.get(kind, kind.replace("_", " ").capitalize()),
+                key,
+                label,
                 percent,
                 entry.get("resets_at"),
                 severity=str(severity) if severity else None,
@@ -201,22 +215,22 @@ def _windows_from_limits(payload: dict) -> list[UsageWindow]:
 
 def _windows_from_named_keys(payload: dict) -> list[UsageWindow]:
     windows: list[UsageWindow] = []
-    for key, label in _NAMED_WINDOWS:
-        block = payload.get(key)
+    for payload_key, key, label in _NAMED_WINDOWS:
+        block = payload.get(payload_key)
         if not isinstance(block, dict):
             continue
         utilization = _as_float(block.get("utilization"))
         if utilization is None:
             continue
-        windows.append(_percent_window(label, utilization, block.get("resets_at")))
+        windows.append(_percent_window(key, label, utilization, block.get("resets_at")))
     return windows
 
 
 def _dollar_windows(payload: dict) -> list[UsageWindow]:
     """Credit/overage plans express the same windows in dollars; surface those too."""
     windows: list[UsageWindow] = []
-    for key, label in _NAMED_WINDOWS:
-        block = payload.get(key)
+    for payload_key, key, label in _NAMED_WINDOWS:
+        block = payload.get(payload_key)
         if not isinstance(block, dict):
             continue
         used = _as_float(block.get("used_dollars"))
@@ -225,6 +239,7 @@ def _dollar_windows(payload: dict) -> list[UsageWindow]:
             continue
         windows.append(
             UsageWindow(
+                key=f"{key}_dollars",
                 label=f"{label} ($)",
                 unit="dollars",
                 used=used,
@@ -374,6 +389,7 @@ def _probe_live_api_limits() -> UsageWindow | None:
         return None
 
     return UsageWindow(
+        key="api_tokens_per_minute",
         label="API tokens/min (live key)",
         unit="tokens",
         used=float(limit) - float(remaining),
@@ -423,8 +439,13 @@ class ClaudeProvider:
         session_limit = self.config.session_token_limit or None
         weekly_limit = self.config.weekly_token_limit or None
 
+        # Deliberately *not* keyed `five_hour`/`weekly_all`: these count raw tokens against a
+        # hand-configured cap, not the plan utilization those keys promise. A consumer that
+        # only understands the authoritative keys should see them as absent, not as a
+        # lower-quality substitute wearing the same name.
         windows = [
             UsageWindow(
+                key="session_tokens",
                 label=f"{self.config.session_window_hours:g}h session tokens (estimated)",
                 unit="tokens",
                 used=float(block_tokens),
@@ -437,6 +458,7 @@ class ClaudeProvider:
                 else "cap not readable locally; set claude.session_token_limit in config",
             ),
             UsageWindow(
+                key="weekly_tokens",
                 label="7d rolling tokens (estimated)",
                 unit="tokens",
                 used=float(_trailing_sum(events, now - timedelta(days=7))),

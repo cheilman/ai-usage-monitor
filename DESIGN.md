@@ -91,6 +91,58 @@ values scrubbed, so a provider-side change shows up as a **failing test** rather
 silently wrong number in the terminal. Parsing is a pure `payload -> windows` function, so the
 whole normalization layer is tested with no network and no keychain.
 
+## The `--json` contract (schema_version 1)
+
+Everything above is about *getting* numbers we can defend. This section is about handing them
+to a machine — specifically the KitEng throttling consumer, which decides whether to start
+work based on how much quota is left. That consumer is why `--json` is a versioned envelope
+rather than whatever the renderer happened to produce:
+
+```json
+{ "schema_version": 1, "generated_at": "...", "providers": [...], "most_constrained": {...} }
+```
+
+- **`schema_version`** — a top-level integer a consumer can gate on. Compatible additions
+  don't move it; anything that would break a parser does. Consumers should refuse an
+  unrecognized version rather than guess.
+- **`generated_at`** — one document-level timestamp, distinct from each provider's own
+  `fetched_at`, so a cached or piped document can be aged without inspecting its contents.
+- **`most_constrained`** — the whole point. The precedence rules (which window matters,
+  what beats what at equal utilization, which windows aren't trustworthy enough to count)
+  live here, computed once, so the consumer is a one-line lookup instead of a second, drifting
+  implementation of our own semantics. Highest utilization wins; ties break on `confidence`,
+  then provider/key alphabetically for determinism.
+
+  It is `null` exactly when no window anywhere has a known, trustworthy utilization. **`null`
+  means quota is unknown, not available** — the same rule the rest of this document applies to
+  `None`. A consumer that reads `null` as "plenty left" inverts the one guarantee this design
+  is built around, so it's stated in the schema docs, enforced by the contract test, and
+  reinforced by the exit code below.
+
+**`key` vs `label`.** Every window carries a stable `key` (`five_hour`, `weekly_all`, ...)
+separate from its display `label`. Without it, a consumer has to match on prose — and prose is
+exactly what we reword when a provider renames something or a panel gets too wide. Keys are
+unique within a provider (a collision gets suffixed rather than silently shadowing a row), and
+an upstream kind we don't recognize gets a slugified key rather than being dropped. Note the
+transcript fallback deliberately does *not* reuse `five_hour`/`weekly_all`: it measures raw
+tokens against a hand-configured cap, not plan utilization, and a consumer that only
+understands the authoritative keys should see it as absent rather than as a lower-quality
+impostor wearing the same name.
+
+**Exit codes** carry the same signal for callers that don't parse at all. Each provider rolls
+up to `ok` / `degraded` / `unavailable` (authoritative-and-no-failures / fallback-or-estimate /
+nothing usable). Exit `0` means at least one provider is `ok`; exit `2` means none is. A
+recorded error demotes a provider even if some window is authoritative — otherwise a Claude
+run whose subscription lookup failed would still report `ok` on the strength of an unrelated
+API-key rate-limit header. `--fail-on-degraded` raises the bar to *every* provider being `ok`,
+for callers that would rather stop than act on an estimate. The net effect is that
+`ai-usage-monitor --json || back_off` is a correct gate by itself: the failure mode of the
+whole tool is "refuse to say", and that refusal is visible without reading a byte of output.
+
+`tests/test_json_contract.py` validates the emitted document against this shape field by
+field, including that `most_constrained` really is the maximum and really does resolve back to
+a window in `providers[]`. The contract erodes loudly or not at all.
+
 ## Layout
 
 - `providers/claude.py`, `providers/gemini.py` — one `fetch() -> ProviderSnapshot` per provider,
@@ -99,6 +151,7 @@ whole normalization layer is tested with no network and no keychain.
 - `config.py` — optional `~/.config/ai-usage-monitor/config.toml`. Not needed for Claude's
   primary path; holds fallback caps and the `use_oauth_usage_api` / `credentials_file` knobs.
 - `render.py` — shared rendering (rich panels + JSON) used by both CLI modes, so snapshot and
-  dashboard never drift apart.
-- `cli.py` — `snapshot` (default, supports `--json`) and `dashboard` (live, `rich.Live`)
-  subcommands.
+  dashboard never drift apart. Also owns the v1 document: `snapshots_to_document()` and the
+  `most_constrained()` precedence rules.
+- `cli.py` — `snapshot` (default, supports `--json` / `--fail-on-degraded`) and `dashboard`
+  (live, `rich.Live`) subcommands, plus `exit_code()`.
