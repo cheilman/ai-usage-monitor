@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 
@@ -10,3 +12,6 @@ def no_ambient_credentials(monkeypatch):
     """
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("CLAUDE_CREDENTIALS_FILE", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    for name in [n for n in os.environ if n.startswith("OPENROUTER_API_KEY_")]:
+        monkeypatch.delenv(name, raising=False)

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -43,9 +43,57 @@ class GeminiConfig:
 
 
 @dataclass
+class OpenRouterKeyConfig:
+    """One API key to report on. `api_key` is read-only, never written back or serialized."""
+
+    label: str
+    api_key: str
+
+
+@dataclass
+class OpenRouterConfig:
+    # Populated purely from the environment (see _discover_openrouter_keys): there is no
+    # config-file knob for the secret itself, the same rule Claude's ANTHROPIC_API_KEY
+    # follows. An empty list means "nothing configured", not an error.
+    keys: list[OpenRouterKeyConfig] = field(default_factory=list)
+
+
+@dataclass
 class Config:
     claude: ClaudeConfig
     gemini: GeminiConfig
+    openrouter: OpenRouterConfig
+
+
+_OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
+
+
+def _discover_openrouter_keys() -> list[OpenRouterKeyConfig]:
+    """One key per matching env var: `OPENROUTER_API_KEY` -> label "default",
+    `OPENROUTER_API_KEY_<LABEL>` -> label "<label>" (lowercased, underscores as hyphens).
+
+    This is why OpenRouter needs zero config for the common case, and why tracking a
+    second or third key (a work account, a CI token, ...) is one `export` away rather than
+    a config-file edit: `export OPENROUTER_API_KEY_WORK=sk-or-...` is enough to add a row.
+    Sorted by label so the reported order is deterministic across runs.
+    """
+    keys: list[OpenRouterKeyConfig] = []
+
+    default_key = os.environ.get(_OPENROUTER_KEY_ENV)
+    if default_key:
+        keys.append(OpenRouterKeyConfig(label="default", api_key=default_key))
+
+    prefix = f"{_OPENROUTER_KEY_ENV}_"
+    for name in sorted(os.environ):
+        if not name.startswith(prefix):
+            continue
+        value = os.environ.get(name)
+        if not value:
+            continue
+        label = name[len(prefix) :].lower().replace("_", "-")
+        if label:
+            keys.append(OpenRouterKeyConfig(label=label, api_key=value))
+    return keys
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -81,6 +129,7 @@ def load_config(path: Path | None = None) -> Config:
             telemetry_log=gemini_log,
             daily_request_limit=gemini_raw.get("daily_request_limit", 1000),
         ),
+        openrouter=OpenRouterConfig(keys=_discover_openrouter_keys()),
     )
 
 
@@ -108,4 +157,11 @@ SAMPLE_CONFIG = """\
 [gemini]
 # telemetry_log = "~/.gemini/telemetry.log"  # requires telemetry.target=local in gemini settings
 daily_request_limit = 1000        # public free-tier default; change for paid tiers
+
+# OpenRouter has no [openrouter] section here at all: it needs no config file, only
+# environment variables, because the config file is not where a secret belongs.
+#   export OPENROUTER_API_KEY=sk-or-...             # -> reported as "default"
+#   export OPENROUTER_API_KEY_WORK=sk-or-...        # -> reported as "work"
+# Every OPENROUTER_API_KEY / OPENROUTER_API_KEY_<LABEL> variable that's set becomes one
+# row; set none and the provider just reports "unavailable".
 """

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ai-usage-monitor"
 dynamic = ["version"]
-description = "CLI usage monitor for Claude and Gemini plan/session limits"
+description = "CLI usage monitor for Claude, Gemini, and OpenRouter plan/session limits"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

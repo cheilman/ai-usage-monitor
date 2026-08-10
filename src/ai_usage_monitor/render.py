@@ -34,6 +34,7 @@ _CONFIDENCE_RANK = {
 _PROVIDER_STYLE = {
     "claude": "#d97757",
     "gemini": "#4285f4",
+    "openrouter": "#6467f2",
 }
 
 # Below this, "as of HH:MM:SS" is close enough to now that calling out the age is just noise.

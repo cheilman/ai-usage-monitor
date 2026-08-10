@@ -327,4 +327,4 @@ def test_cli_survives_a_corrupt_cache_file(tmp_path):
 
     assert result.returncode == 2, result.stderr
     providers = json.loads(result.stdout)["providers"]
-    assert {entry["provider"] for entry in providers} == {"claude", "gemini"}
+    assert {entry["provider"] for entry in providers} == {"claude", "gemini", "openrouter"}

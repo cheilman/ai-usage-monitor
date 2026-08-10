@@ -1,0 +1,23 @@
+{
+  "_comment": "Golden fixture: real GET https://openrouter.ai/api/v1/key response shape (see https://openrouter.ai/docs/api_reference/limits), account-specific values scrubbed. If OpenRouter changes this shape, the parser tests fail loudly instead of the CLI printing a silently wrong number.",
+  "data": {
+    "label": "sk-or-...abcd",
+    "limit": 10.0,
+    "limit_remaining": 7.5,
+    "limit_reset": "monthly",
+    "is_free_tier": false,
+    "is_provisioning_key": false,
+    "usage": 2.5,
+    "usage_daily": 0.1,
+    "usage_weekly": 0.6,
+    "usage_monthly": 2.5,
+    "byok_usage": 0.0,
+    "byok_usage_daily": 0.0,
+    "byok_usage_weekly": 0.0,
+    "byok_usage_monthly": 0.0,
+    "rate_limit": {
+      "requests": 20,
+      "interval": "10s"
+    }
+  }
+}

@@ -65,6 +65,25 @@ fallback. Tokens are never logged, never included in an error message, never ser
   gemini-cli's published quota docs — this is a hardcoded, driftable value and is flagged as
   `estimated` confidence, never `authoritative`.
 
+**OpenRouter** — chain: `GET /api/v1/key` → unavailable. No fallback exists because none is
+needed.
+
+- Unlike Claude and Gemini, OpenRouter publishes a small, documented, key-scoped usage
+  endpoint: `GET https://openrouter.ai/api/v1/key`, `Authorization: Bearer <api key>` (see
+  https://openrouter.ai/docs/api_reference/limits). It returns the spending cap configured on
+  *that key* (`limit` / `limit_remaining` / `limit_reset`, `null` when uncapped) plus running
+  totals (`usage`, `usage_daily`, `usage_weekly`, `usage_monthly`) and the same figures for
+  BYOK (bring-your-own-key) spend. Every window from it is `authoritative`.
+- "Usage by API key(s)" (plural) is the point: a user may hold several keys (personal,
+  project, CI) and wants all of them at a glance. There is no config-file knob for the secret
+  itself — `config._discover_openrouter_keys` finds every `OPENROUTER_API_KEY` (→ label
+  `default`) and `OPENROUTER_API_KEY_<LABEL>` (→ label `<label>`) environment variable, the
+  same rule Claude's `ANTHROPIC_API_KEY` follows.
+- Each key is queried and reported independently, with its own `SourceAttempt` named after its
+  label, so a revoked or misconfigured key can't hide the others — `doctor` says exactly which
+  key failed and why. No keys configured at all reports `no_credential` with the `export`
+  needed, rather than silently omitting the provider.
+
 ## Fragility, called out explicitly
 
 **Nothing here is a supported public API.** Every source can break without notice, so the
@@ -78,6 +97,7 @@ design's job is to fail loudly and legibly rather than to keep printing a confid
 | `anthropic-ratelimit-*` headers | documented, but measures API-key limits | header names change | header absent | window simply omitted |
 | Gemini `telemetry.log` | off by default, best-effort format | gemini-cli changes the event schema | file absent, no matching events | `unavailable` + the settings.json snippet to enable it |
 | Gemini tier caps | hardcoded from public docs | Google changes tier quotas | undetectable — hence never `authoritative` | reported as `estimated` |
+| OpenRouter `/api/v1/key` | documented, but small and could still change | OpenRouter renames/removes a field | HTTP != 200, non-JSON body, no `data` object, no recognizable usage fields | `unavailable` for that key; other keys unaffected |
 
 Both local-file fallbacks (`~/.claude/projects/*.jsonl`, `~/.gemini/telemetry.log`) are
 undocumented-for-third-party-use internal formats owned by the respective CLIs. Every
@@ -184,8 +204,9 @@ all" — rather than per-source explanations, which now live in `attempts`.
 
 ## Layout
 
-- `providers/claude.py`, `providers/gemini.py` — one `fetch() -> ProviderSnapshot` per provider,
-  each running its own ordered source chain through `run_source`.
+- `providers/claude.py`, `providers/gemini.py`, `providers/openrouter.py` — one
+  `fetch() -> ProviderSnapshot` per provider, each running its own ordered source chain through
+  `run_source` (OpenRouter's "chain" is one source per configured key).
 - `providers/base.py` — the `UsageProvider` protocol and `run_source`, which times one source
   and turns its result (or its exception) into a `SourceAttempt`.
 - `credentials.py` — read-only keychain / credential-file access.

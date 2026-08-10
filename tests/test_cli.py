@@ -48,7 +48,7 @@ def test_snapshot_json_emits_a_valid_v1_document(tmp_path):
     assert document["schema_version"] == 1
 
     providers = {p["provider"] for p in document["providers"]}
-    assert providers == {"claude", "gemini"}
+    assert providers == {"claude", "gemini", "openrouter"}
 
     claude = next(p for p in document["providers"] if p["provider"] == "claude")
     assert "plan" in claude and "notes" in claude
@@ -67,7 +67,7 @@ def test_snapshot_json_includes_attempts(tmp_path):
     document = json.loads(result.stdout)
     payload = {entry["provider"]: entry for entry in document["providers"]}
 
-    for provider, expected_sources in (("claude", 2), ("gemini", 1)):
+    for provider, expected_sources in (("claude", 2), ("gemini", 1), ("openrouter", 1)):
         entry = payload[provider]
         assert entry["status"] == "unavailable"
         assert len(entry["attempts"]) == expected_sources

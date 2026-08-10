@@ -1,7 +1,7 @@
 # ai-usage-monitor
 
-Terminal tool that reports current usage, plan caps (where known), and reset timing for Claude
-and Gemini, so you don't have to dig through each provider's own UI.
+Terminal tool that reports current usage, plan caps (where known), and reset timing for Claude,
+Gemini, and OpenRouter, so you don't have to dig through each provider's own UI.
 
 Claude works with **no configuration**: usage comes from the same OAuth-scoped endpoint Claude
 Code itself calls, authenticated with the token already in your keychain, and the percentages
@@ -41,6 +41,7 @@ ai-usage-monitor --json --fail-on-degraded
 
 # just one provider
 ai-usage-monitor snapshot --provider claude
+ai-usage-monitor snapshot --provider openrouter
 
 # live btop-style dashboard, refreshing every 30s
 ai-usage-monitor dashboard
@@ -177,6 +178,8 @@ key holds whichever branch produced the row.
 | claude | `session_tokens` / `weekly_tokens` | **fallback only** — raw transcript token counts against a hand-configured cap, deliberately *not* keyed as the authoritative windows |
 | claude | `api_tokens_per_minute` | `ANTHROPIC_API_KEY` rate limit — a different thing from subscription usage |
 | gemini | `daily_requests` / `daily_tokens` | today's requests / tokens |
+| openrouter | `credit_limit_<label>` | spend against that key's configured credit cap |
+| openrouter | `usage_<label>` | all-time spend, for keys with no cap configured |
 
 An unrecognized upstream window kind gets a slugified key rather than being dropped, so a new
 plan shape shows up as an extra row.
@@ -217,6 +220,14 @@ from subscription usage, which is why it's a separate row.
 
 **Gemini** has no reachable quota API, so it depends on local telemetry (below).
 
+**OpenRouter** is the one provider with a real, documented, key-scoped usage endpoint:
+`GET https://openrouter.ai/api/v1/key`, authenticated with `Authorization: Bearer <api key>`.
+Every window it produces is `authoritative` — there's no fallback source, because none is
+needed. Every `OPENROUTER_API_KEY` (→ label `default`) or `OPENROUTER_API_KEY_<LABEL>`
+(→ label `<label>`) environment variable becomes its own row, so tracking several keys (a
+personal one, a work one, a CI token) is a matter of exporting more variables, not editing
+config. One revoked or misconfigured key reports its own error without hiding the others.
+
 ## Config
 
 Optional — Claude's primary path needs none of it.
@@ -245,6 +256,17 @@ Gemini local usage requires enabling telemetry in `~/.gemini/settings.json` firs
 ```json
 {"telemetry": {"enabled": true, "target": "local", "outfile": "~/.gemini/telemetry.log"}}
 ```
+
+OpenRouter needs no config file entry at all — only environment variables, the same rule
+`ANTHROPIC_API_KEY` follows, because a secret doesn't belong in a config file:
+
+```sh
+export OPENROUTER_API_KEY=sk-or-...              # -> reported as "default"
+export OPENROUTER_API_KEY_WORK=sk-or-...         # -> reported as "work"
+```
+
+Set none and the provider reports `unavailable` with instructions; set several and each gets
+its own row and its own `doctor` attempt, so one bad key can't hide the others.
 
 ## Development
 
