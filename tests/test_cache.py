@@ -221,6 +221,7 @@ def test_cache_file_contains_no_credentials(monkeypatch, tmp_path):
         "fetched_at",
         "plan",
         "windows",
+        "attempts",
         "notes",
         "errors",
     }

@@ -27,6 +27,8 @@ def run_cli(tmp_path, *args):
         "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-home"),
         "AI_USAGE_MONITOR_CONFIG": str(config),
         "CLAUDE_CREDENTIALS_FILE": str(tmp_path / "no-credentials.json"),
+        # Pin rich's width so doctor output doesn't wrap mid-assertion.
+        "COLUMNS": "200",
     }
     env.pop("ANTHROPIC_API_KEY", None)
     return subprocess.run(
@@ -57,6 +59,40 @@ def test_snapshot_json_emits_a_valid_v1_document(tmp_path):
     assert document["most_constrained"] is None
     assert {p["status"] for p in document["providers"]} == {"unavailable"}
     assert result.returncode == 2, result.stderr
+
+
+def test_snapshot_json_includes_attempts(tmp_path):
+    result = run_cli(tmp_path, "snapshot", "--json")
+    assert result.returncode == 2, result.stderr
+    document = json.loads(result.stdout)
+    payload = {entry["provider"]: entry for entry in document["providers"]}
+
+    for provider, expected_sources in (("claude", 2), ("gemini", 1)):
+        entry = payload[provider]
+        assert entry["status"] == "unavailable"
+        assert len(entry["attempts"]) == expected_sources
+        for attempt in entry["attempts"]:
+            assert set(attempt) == {"name", "outcome", "detail", "duration_ms", "remediation"}
+            assert attempt["outcome"] != "ok"
+            assert attempt["remediation"]
+
+
+def test_doctor_lists_sources_and_exits_nonzero_when_all_fail(tmp_path):
+    result = run_cli(tmp_path, "doctor")
+    # No source can work in this env, so doctor reports failure for scripts to gate on.
+    assert result.returncode == 1, result.stderr
+    assert "CLAUDE sources" in result.stdout
+    assert "GEMINI sources" in result.stdout
+    assert "no_credential" in result.stdout
+    assert "not_found" in result.stdout
+    assert "0/2 source(s) healthy" in result.stdout
+
+
+def test_doctor_single_provider_json(tmp_path):
+    result = run_cli(tmp_path, "doctor", "--provider", "gemini", "--json")
+    payload = json.loads(result.stdout)
+    assert [entry["provider"] for entry in payload] == ["gemini"]
+    assert payload[0]["attempts"][0]["outcome"] == "not_found"
 
 
 def test_bare_invocation_accepts_the_same_flags_as_snapshot(tmp_path):

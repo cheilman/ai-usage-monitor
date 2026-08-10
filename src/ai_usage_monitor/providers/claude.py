@@ -1,8 +1,10 @@
 """Claude usage provider.
 
 Ordered source chain, per the approved design (K-000076 §4.2). Sources are tried in order
-and the first one that yields windows wins; each failure is recorded on the snapshot so
-`--json` consumers can see *why* they got a degraded number instead of a real one.
+and the first one that yields windows wins; each one records a SourceAttempt whether it
+works or not (`ai-usage-monitor doctor` prints those attempts -- both sources here read
+undocumented surfaces that will eventually change, and an attempt list is what makes that
+visible instead of silent):
 
 1. **`GET https://api.anthropic.com/api/oauth/usage`** (primary, AUTHORITATIVE).
    The private endpoint Claude Code itself uses, authenticated with the OAuth access token
@@ -14,7 +16,8 @@ and the first one that yields windows wins; each failure is recorded on the snap
    cap, so this path needs **no user-supplied limits at all**. We prefer `limits[]` because
    it is plan-shape-agnostic, and fall back to the named keys if it's absent.
 
-2. **Local transcript scraping** (fallback, ESTIMATED at best).
+2. **Local transcript scraping** (fallback, ESTIMATED at best). Only tried when source 1
+   yields nothing.
    Claude Code writes one JSONL file per session under ~/.claude/projects/<project>/*.jsonl
    with token counts in `message.usage`. Summing the active rolling block (gap-based split,
    the heuristic the community `ccusage` tool uses) gives token *counts* but no plan cap --
@@ -23,17 +26,18 @@ and the first one that yields windows wins; each failure is recorded on the snap
    confidence UNAVAILABLE otherwise. It exists for non-macOS/headless boxes and for when the
    credential is missing or expired; it is never used while source 1 is working.
 
-Separately (not part of the chain): if `ANTHROPIC_API_KEY` is set we read the
-`anthropic-ratelimit-tokens-*` headers off the free `/v1/messages/count_tokens` endpoint.
-Those are authoritative but describe *API-key* rate limits, which are a different thing from
-subscription usage, so they are reported as their own clearly-labelled window and never
-conflated with sources 1 or 2.
+Separately (not part of the chain, and not recorded as a SourceAttempt): if
+`ANTHROPIC_API_KEY` is set we read the `anthropic-ratelimit-tokens-*` headers off the free
+`/v1/messages/count_tokens` endpoint. Those are authoritative but describe *API-key* rate
+limits, which are a different thing from subscription usage, so they are reported as their
+own clearly-labelled window and never conflated with sources 1 or 2.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -47,7 +51,14 @@ from ai_usage_monitor.credentials import (
     OAuthCredential,
     load_claude_credential,
 )
-from ai_usage_monitor.models import Confidence, ProviderSnapshot, UsageWindow
+from ai_usage_monitor.models import (
+    Confidence,
+    ProviderSnapshot,
+    SourceAttempt,
+    SourceOutcome,
+    UsageWindow,
+)
+from ai_usage_monitor.providers.base import SourceResult, run_source
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages/count_tokens"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -280,6 +291,88 @@ def parse_oauth_usage(payload: dict) -> tuple[list[UsageWindow], str | None, lis
     return windows, str(plan) if plan else None, _notes_from_payload(payload)
 
 
+def _try_live_usage(
+    config: ClaudeConfig,
+) -> tuple[list[UsageWindow], str | None, list[str], SourceAttempt]:
+    """Run source 1 (the OAuth usage endpoint), timing it and building a SourceAttempt.
+
+    Not a plain `run_source`-shaped source like the transcript fallback below: a successful
+    fetch also carries `plan` and account `notes`, which the shared
+    `(windows, outcome, detail, remediation)` shape has no room for.
+    """
+    started = time.perf_counter()
+
+    def _attempt(outcome: SourceOutcome, detail: str, remediation: str | None) -> SourceAttempt:
+        return SourceAttempt(
+            name=OAUTH_SOURCE,
+            outcome=outcome,
+            detail=detail,
+            duration_ms=(time.perf_counter() - started) * 1000.0,
+            remediation=remediation,
+        )
+
+    if not config.use_oauth_usage_api:
+        return (
+            [],
+            None,
+            [],
+            _attempt(
+                SourceOutcome.NO_CREDENTIAL,
+                "disabled by config (claude.use_oauth_usage_api = false)",
+                "Set claude.use_oauth_usage_api = true (or remove the override) to use the "
+                "live OAuth usage endpoint.",
+            ),
+        )
+
+    try:
+        credential = load_claude_credential(config.credentials_file)
+        if credential.is_expired:
+            raise CredentialError(
+                f"OAuth credential from {credential.source} expired "
+                f"{credential.expires_at:%Y-%m-%d %H:%M UTC} -- run `claude` once to refresh"
+            )
+        windows, plan, notes = parse_oauth_usage(fetch_oauth_usage(credential))
+        if not windows:
+            raise UsageSourceError(
+                "live usage response contained no recognizable windows "
+                "(limits[]/five_hour/seven_day all absent) -- the payload shape may have changed"
+            )
+    except CredentialError as exc:
+        return (
+            [],
+            None,
+            [],
+            _attempt(
+                SourceOutcome.NO_CREDENTIAL,
+                str(exc),
+                "Run `claude` once so Claude Code stores a fresh OAuth credential.",
+            ),
+        )
+    except UsageSourceError as exc:
+        return (
+            [],
+            None,
+            [],
+            _attempt(
+                SourceOutcome.ERROR,
+                str(exc),
+                "Check network access to api.anthropic.com, or that Claude Code itself can "
+                "still report usage.",
+            ),
+        )
+
+    return (
+        windows,
+        plan or credential.subscription_type,
+        notes,
+        _attempt(
+            SourceOutcome.OK,
+            f"{len(windows)} window(s), plan={plan or credential.subscription_type}",
+            None,
+        ),
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Source 2: local transcript scrape (fallback only)
 # --------------------------------------------------------------------------------------
@@ -348,8 +441,87 @@ def _trailing_sum(events: list[_Event], since: datetime) -> int:
     return sum(e.tokens for e in events if e.timestamp >= since)
 
 
+def _transcript_source(config: ClaudeConfig, now: datetime) -> SourceResult:
+    """Source 2: local Claude Code JSONL transcripts (fallback; ESTIMATED at best)."""
+    data_dir = config.data_dir
+    if not data_dir.exists():
+        return (
+            [],
+            SourceOutcome.NOT_FOUND,
+            f"{data_dir} does not exist",
+            "Run Claude Code at least once, or point CLAUDE_CONFIG_DIR at the home "
+            "directory that holds your .claude/projects.",
+        )
+
+    transcript_count = sum(1 for _ in data_dir.rglob("*.jsonl"))
+    events = _iter_events(data_dir)
+    if not events:
+        # Files but no parseable usage records is the interesting case: that's what schema
+        # drift looks like from here, and it's indistinguishable from "never used" without
+        # the file count.
+        detail = (
+            f"{transcript_count} transcript file(s) under {data_dir}, but no records with "
+            "a timestamp and message.usage"
+            if transcript_count
+            else f"no *.jsonl transcripts under {data_dir}"
+        )
+        remediation = (
+            "Transcripts exist but carry no usage data -- Claude Code's JSONL schema may "
+            "have changed. This source needs updating."
+            if transcript_count
+            else "Run Claude Code at least once so it writes a session transcript."
+        )
+        return [], SourceOutcome.EMPTY, detail, remediation
+
+    window = timedelta(hours=config.session_window_hours)
+    block_start, block_tokens = _current_block(events, window)
+    session_limit = config.session_token_limit or None
+    weekly_limit = config.weekly_token_limit or None
+
+    # Deliberately *not* keyed `five_hour`/`weekly_all`: these count raw tokens against a
+    # hand-configured cap, not the plan utilization those keys promise. A consumer that
+    # only understands the authoritative keys should see them as absent, not as a
+    # lower-quality substitute wearing the same name.
+    windows = [
+        UsageWindow(
+            key="session_tokens",
+            label=f"{config.session_window_hours:g}h session tokens (estimated)",
+            unit="tokens",
+            used=float(block_tokens),
+            limit=float(session_limit) if session_limit else None,
+            reset_at=block_start + window if block_start else None,
+            confidence=Confidence.ESTIMATED if session_limit else Confidence.UNAVAILABLE,
+            source=TRANSCRIPT_SOURCE,
+            note=None
+            if session_limit
+            else "cap not readable locally; set claude.session_token_limit in config",
+        ),
+        UsageWindow(
+            key="weekly_tokens",
+            label="7d rolling tokens (estimated)",
+            unit="tokens",
+            used=float(_trailing_sum(events, now - timedelta(days=7))),
+            limit=float(weekly_limit) if weekly_limit else None,
+            reset_at=None,
+            confidence=Confidence.ESTIMATED if weekly_limit else Confidence.UNAVAILABLE,
+            source=TRANSCRIPT_SOURCE,
+            note="weekly reset anchor is account-specific and not exposed locally",
+        ),
+    ]
+
+    remediation = None
+    if not (session_limit and weekly_limit):
+        remediation = (
+            "Usage is readable but plan caps are not published by Anthropic; set "
+            "claude.session_token_limit / claude.weekly_token_limit in config for percentages."
+        )
+    detail = f"{len(events)} usage record(s) across {transcript_count} transcript file(s)"
+    return windows, SourceOutcome.OK, detail, remediation
+
+
 # --------------------------------------------------------------------------------------
-# Separate concern: API-key rate limit headers
+# Separate concern: API-key rate limit headers (not part of the chain above, and not
+# recorded as a SourceAttempt -- it measures a different thing and is purely opt-in).
 # --------------------------------------------------------------------------------------
 
 
@@ -378,6 +550,7 @@ def _probe_live_api_limits() -> UsageWindow | None:
         with urllib.request.urlopen(request, timeout=10) as response:
             headers = response.headers
     except urllib.error.HTTPError as exc:
+        # 4xx responses still carry rate-limit headers, so they're worth reading.
         headers = exc.headers
     except (urllib.error.URLError, TimeoutError, OSError):
         return None
@@ -407,96 +580,29 @@ class ClaudeProvider:
     def __init__(self, config: ClaudeConfig):
         self.config = config
 
-    # -- source 1 ------------------------------------------------------------------
-    def _fetch_live_usage(self) -> tuple[list[UsageWindow], str | None, list[str]]:
-        """Raises CredentialError/UsageSourceError; both are caught by fetch()."""
-        credential = load_claude_credential(self.config.credentials_file)
-        if credential.is_expired:
-            raise CredentialError(
-                f"OAuth credential from {credential.source} expired "
-                f"{credential.expires_at:%Y-%m-%d %H:%M UTC} -- run `claude` once to refresh"
-            )
-
-        windows, plan, notes = parse_oauth_usage(fetch_oauth_usage(credential))
-        if not windows:
-            raise UsageSourceError(
-                "live usage response contained no recognizable windows "
-                "(limits[]/five_hour/seven_day all absent) -- the payload shape may have changed"
-            )
-        return windows, plan or credential.subscription_type, notes
-
-    # -- source 2 ------------------------------------------------------------------
-    def _transcript_windows(self, now: datetime) -> tuple[list[UsageWindow], str | None]:
-        events = _iter_events(self.config.data_dir)
-        if not events:
-            return [], (
-                f"no Claude Code session transcripts found under {self.config.data_dir}. "
-                "Run Claude Code at least once, or point CLAUDE_CONFIG_DIR at the right home."
-            )
-
-        window = timedelta(hours=self.config.session_window_hours)
-        block_start, block_tokens = _current_block(events, window)
-        session_limit = self.config.session_token_limit or None
-        weekly_limit = self.config.weekly_token_limit or None
-
-        # Deliberately *not* keyed `five_hour`/`weekly_all`: these count raw tokens against a
-        # hand-configured cap, not the plan utilization those keys promise. A consumer that
-        # only understands the authoritative keys should see them as absent, not as a
-        # lower-quality substitute wearing the same name.
-        windows = [
-            UsageWindow(
-                key="session_tokens",
-                label=f"{self.config.session_window_hours:g}h session tokens (estimated)",
-                unit="tokens",
-                used=float(block_tokens),
-                limit=float(session_limit) if session_limit else None,
-                reset_at=block_start + window if block_start else None,
-                confidence=Confidence.ESTIMATED if session_limit else Confidence.UNAVAILABLE,
-                source=TRANSCRIPT_SOURCE,
-                note=None
-                if session_limit
-                else "cap not readable locally; set claude.session_token_limit in config",
-            ),
-            UsageWindow(
-                key="weekly_tokens",
-                label="7d rolling tokens (estimated)",
-                unit="tokens",
-                used=float(_trailing_sum(events, now - timedelta(days=7))),
-                limit=float(weekly_limit) if weekly_limit else None,
-                reset_at=None,
-                confidence=Confidence.ESTIMATED if weekly_limit else Confidence.UNAVAILABLE,
-                source=TRANSCRIPT_SOURCE,
-                note="weekly reset anchor is account-specific and not exposed locally",
-            ),
-        ]
-        return windows, None
-
     def fetch(self) -> ProviderSnapshot:
         now = datetime.now(UTC)
         snapshot = ProviderSnapshot(provider=self.name, fetched_at=now)
 
-        if self.config.use_oauth_usage_api:
-            try:
-                windows, plan, notes = self._fetch_live_usage()
-            except (CredentialError, UsageSourceError) as exc:
-                live_error = str(exc)
-            else:
-                snapshot.windows.extend(windows)
-                snapshot.plan = plan
-                snapshot.notes.extend(notes)
-                live_error = None
-        else:
-            live_error = "live usage API disabled (claude.use_oauth_usage_api = false)"
+        windows, plan, notes, live_attempt = _try_live_usage(self.config)
+        snapshot.attempts.append(live_attempt)
 
-        # Only degrade to the local estimate when the authoritative source gave us nothing.
-        if not snapshot.windows:
-            snapshot.errors.append(f"live usage API unavailable: {live_error}")
-            transcript_windows, transcript_error = self._transcript_windows(now)
-            if transcript_error:
-                snapshot.errors.append(transcript_error)
-            else:
+        if live_attempt.ok:
+            snapshot.windows.extend(windows)
+            snapshot.plan = plan
+            snapshot.notes.extend(notes)
+        else:
+            # Only degrade to the local estimate when the authoritative source gave us nothing.
+            snapshot.errors.append(f"live usage API unavailable: {live_attempt.detail}")
+            transcript_windows, transcript_attempt = run_source(
+                TRANSCRIPT_SOURCE, lambda: _transcript_source(self.config, now)
+            )
+            snapshot.attempts.append(transcript_attempt)
+            if transcript_attempt.ok:
                 snapshot.errors.append("falling back to local transcript estimate")
                 snapshot.windows.extend(transcript_windows)
+            else:
+                snapshot.errors.append(transcript_attempt.detail)
 
         # Independent of the chain above: API-key rate limits measure a different thing.
         api_key_window = _probe_live_api_limits()

@@ -45,7 +45,36 @@ ai-usage-monitor snapshot --provider claude
 # live btop-style dashboard, refreshing every 30s
 ai-usage-monitor dashboard
 ai-usage-monitor dashboard --interval 10
+
+# why is a number missing? show every source tried, per provider
+ai-usage-monitor doctor
+ai-usage-monitor doctor --provider gemini --json
 ```
+
+## Diagnosing missing numbers
+
+Every source this tool reads is an undocumented internal format or an unpublished endpoint, so
+sources break. `doctor` reports each one tried, per provider, with an outcome (`ok`, `empty`,
+`not_found`, `no_credential`, `error`), the detail behind it, how long it took, and what to do
+about it:
+
+```
+╭─ CLAUDE sources ──────────────────────────────────────────────────────────╮
+│ [-] GET /api/oauth/usage (Claude Code OAuth token)  no_credential  (4ms)   │
+│       no Claude Code OAuth credential found (looked in keychain)          │
+│       -> Run `claude` once so Claude Code stores a fresh OAuth credential.│
+│                                                                           │
+│ [OK] local JSONL transcript scrape (fallback; ~/.claude/projects)  ok  (2ms) │
+│       1 usage record(s) across 1 transcript file(s)                       │
+│                                                                           │
+│ 1/2 source(s) healthy; overall status: unavailable                        │
+╰───────────────────────────────────────────────────────────────────────────╯
+```
+
+Only sources actually tried show up: the transcript fallback is skipped entirely (no attempt
+recorded) whenever the OAuth source above it already succeeded. `doctor` exits non-zero if any
+selected provider has no healthy source, so it's usable as a check in scripts. The same
+attempts appear in the `attempts` array of any `--json` output.
 
 ## Caching
 
@@ -95,6 +124,15 @@ defensively — refuse a `schema_version` you don't recognize rather than guessi
           "note": null,
           "is_active": false,
           "severity": "normal"
+        }
+      ],
+      "attempts": [
+        {
+          "name": "GET /api/oauth/usage (Claude Code OAuth token)",
+          "outcome": "ok",
+          "detail": "2 window(s), plan=pro",
+          "duration_ms": 182.4,
+          "remediation": null
         }
       ],
       "notes": [],

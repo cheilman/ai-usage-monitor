@@ -18,6 +18,7 @@ from ai_usage_monitor.models import (
     Confidence,
     ProviderSnapshot,
     ProviderStatus,
+    SourceOutcome,
     UsageWindow,
 )
 from ai_usage_monitor.render import SCHEMA_VERSION, most_constrained, snapshots_to_document
@@ -40,12 +41,21 @@ WINDOW_FIELDS = {
     "severity": (str, type(None)),
 }
 
+ATTEMPT_FIELDS = {
+    "name": str,
+    "outcome": str,
+    "detail": str,
+    "duration_ms": (float, int),
+    "remediation": (str, type(None)),
+}
+
 PROVIDER_FIELDS = {
     "provider": str,
     "status": str,
     "fetched_at": str,
     "plan": (str, type(None)),
     "windows": list,
+    "attempts": list,
     "notes": list,
     "errors": list,
 }
@@ -73,6 +83,12 @@ def assert_valid_v1(document: dict) -> None:
         assert provider["status"] in {s.value for s in ProviderStatus}
         datetime.fromisoformat(provider["fetched_at"])
         assert all(isinstance(n, str) for n in provider["notes"] + provider["errors"])
+
+        for attempt in provider["attempts"]:
+            assert set(attempt) == set(ATTEMPT_FIELDS)
+            for field, expected in ATTEMPT_FIELDS.items():
+                assert isinstance(attempt[field], expected), f"attempt.{field}"
+            assert attempt["outcome"] in {o.value for o in SourceOutcome}
 
         keys = [w["key"] for w in provider["windows"]]
         assert len(keys) == len(set(keys)), f"duplicate window keys in {provider['provider']}"

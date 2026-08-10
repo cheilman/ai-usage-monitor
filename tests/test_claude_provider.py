@@ -6,7 +6,7 @@ import pytest
 
 from ai_usage_monitor.config import ClaudeConfig
 from ai_usage_monitor.credentials import CredentialError, OAuthCredential
-from ai_usage_monitor.models import Confidence
+from ai_usage_monitor.models import Confidence, ProviderStatus, SourceOutcome
 from ai_usage_monitor.providers import claude as claude_module
 from ai_usage_monitor.providers.claude import (
     OAUTH_SOURCE,
@@ -46,6 +46,10 @@ def _credential(expires_at: datetime | None = None) -> OAuthCredential:
         subscription_type="pro",
         source="test",
     )
+
+
+def _no_credential(path):
+    raise CredentialError("no Claude Code OAuth credential found (looked in keychain)")
 
 
 # ---------------------------------------------------------------------------------------
@@ -166,12 +170,13 @@ def test_live_api_is_primary_and_transcripts_are_not_used(tmp_path, monkeypatch)
     assert [w.source for w in snapshot.windows] == [OAUTH_SOURCE, OAUTH_SOURCE]
     assert all(w.confidence == Confidence.AUTHORITATIVE for w in snapshot.windows)
 
+    # Only the source actually tried gets an attempt recorded.
+    assert [a.name for a in snapshot.attempts] == [OAUTH_SOURCE]
+    assert snapshot.attempts[0].outcome == SourceOutcome.OK
+
 
 def test_transcript_fallback_activates_when_credential_is_missing(tmp_path, monkeypatch):
     projects = _seed_transcripts(tmp_path)
-
-    def _no_credential(path):
-        raise CredentialError("no Claude Code OAuth credential found (looked in keychain)")
 
     monkeypatch.setattr(claude_module, "load_claude_credential", _no_credential)
     monkeypatch.setattr(
@@ -259,7 +264,98 @@ def test_no_data_dir_reports_unavailable(tmp_path):
     assert snapshot.windows == []
 
 
-def test_sums_tokens_in_active_block(tmp_path):
+# ---------------------------------------------------------------------------------------
+# Structured source attempts and the `doctor` audit trail
+# ---------------------------------------------------------------------------------------
+
+
+def test_all_sources_failing_still_yields_full_attempt_list(tmp_path, monkeypatch):
+    """Every source failing must produce a complete audit trail, not an empty/crashed result."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(claude_module, "load_claude_credential", _no_credential)
+
+    provider = ClaudeProvider(ClaudeConfig(data_dir=tmp_path / "missing"))
+    snapshot = provider.fetch()
+
+    assert [a.name for a in snapshot.attempts] == [OAUTH_SOURCE, TRANSCRIPT_SOURCE]
+    assert not any(a.ok for a in snapshot.attempts)
+    assert snapshot.status == ProviderStatus.UNAVAILABLE
+
+    live, transcripts = snapshot.attempts
+    assert live.outcome == SourceOutcome.NO_CREDENTIAL
+    assert "no Claude Code OAuth credential" in live.detail
+    assert transcripts.outcome == SourceOutcome.NOT_FOUND
+    assert "missing" in transcripts.detail
+
+    # Every failed attempt has to tell the user what to actually do about it.
+    assert all(a.remediation for a in snapshot.attempts)
+    assert all(a.duration_ms >= 0 for a in snapshot.attempts)
+
+
+def test_transcripts_present_but_unparseable_is_empty_not_not_found(tmp_path, monkeypatch):
+    """Schema drift (files exist, no usage records) must be distinguishable from 'never used'."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(claude_module, "load_claude_credential", _no_credential)
+    data_dir = tmp_path / "projects" / "p"
+    data_dir.mkdir(parents=True)
+    _write_jsonl(data_dir / "session.jsonl", [{"timestamp": "2026-01-01T00:00:00+00:00"}])
+
+    provider = ClaudeProvider(ClaudeConfig(data_dir=tmp_path / "projects"))
+    attempt = next(a for a in provider.fetch().attempts if a.name == TRANSCRIPT_SOURCE)
+
+    assert attempt.outcome == SourceOutcome.EMPTY
+    assert "1 transcript file(s)" in attempt.detail
+    assert "schema may have changed" in attempt.remediation
+
+
+def test_successful_transcript_source_records_ok_attempt(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(claude_module, "load_claude_credential", _no_credential)
+    data_dir = tmp_path / "projects" / "p"
+    data_dir.mkdir(parents=True)
+    _write_jsonl(
+        data_dir / "session.jsonl",
+        [
+            {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "message": {"usage": {"input_tokens": 10, "output_tokens": 5}},
+            }
+        ],
+    )
+
+    config = ClaudeConfig(
+        data_dir=tmp_path / "projects", session_token_limit=100, weekly_token_limit=200
+    )
+    attempt = next(
+        a for a in ClaudeProvider(config).fetch().attempts if a.name == TRANSCRIPT_SOURCE
+    )
+
+    assert attempt.outcome == SourceOutcome.OK
+    assert attempt.ok
+    assert "1 usage record(s)" in attempt.detail
+    assert attempt.remediation is None
+
+
+def test_source_exception_becomes_error_attempt(tmp_path, monkeypatch):
+    """A source that blows up degrades to an `error` attempt instead of killing the snapshot."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(claude_module, "load_claude_credential", _no_credential)
+    monkeypatch.setattr(
+        claude_module,
+        "_transcript_source",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    snapshot = ClaudeProvider(ClaudeConfig(data_dir=tmp_path)).fetch()
+    attempt = next(a for a in snapshot.attempts if a.name == TRANSCRIPT_SOURCE)
+
+    assert attempt.outcome == SourceOutcome.ERROR
+    assert "RuntimeError: boom" in attempt.detail
+    assert snapshot.status == ProviderStatus.UNAVAILABLE
+
+
+def test_sums_tokens_in_active_block(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     data_dir = tmp_path / "projects" / "my-project"
     data_dir.mkdir(parents=True)
 

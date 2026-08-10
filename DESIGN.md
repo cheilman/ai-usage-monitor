@@ -164,17 +164,37 @@ credentials, because `ProviderSnapshot` has nowhere to put one.
 Because cached data is by definition not "now", the panel footer reports the snapshot's own
 `fetched_at` plus an age (`as of 09:15:02 UTC (43s ago)`) rather than the redraw time.
 
+## Source attempts and `doctor`
+
+Confidence flags say how good a number is, but not why a number is *missing*. Since every
+source here will eventually break, each provider records a `SourceAttempt(name, outcome,
+detail, duration_ms, remediation)` for **every** source it tries, successful or not, in
+`ProviderSnapshot.attempts`. Outcomes are `ok` / `empty` / `not_found` / `no_credential` /
+`error`, and a source that raises unexpectedly is caught and downgraded to an `error` attempt
+rather than taking the whole snapshot down (`providers/base.py:run_source`).
+
+`ai-usage-monitor doctor` prints that trail per provider with a remediation line, and exits
+non-zero when a provider has no healthy source. The distinction that matters most is
+`not_found` (never used / wrong path) versus `empty` (the file is there but carries no records
+we recognise) — the latter is what schema drift looks like from the outside, and previously
+both just rendered as "no data".
+
+`ProviderSnapshot.errors` is reserved for genuine, provider-level failures — "nothing worked at
+all" — rather than per-source explanations, which now live in `attempts`.
+
 ## Layout
 
 - `providers/claude.py`, `providers/gemini.py` — one `fetch() -> ProviderSnapshot` per provider,
-  each running its own ordered source chain.
+  each running its own ordered source chain through `run_source`.
+- `providers/base.py` — the `UsageProvider` protocol and `run_source`, which times one source
+  and turns its result (or its exception) into a `SourceAttempt`.
 - `credentials.py` — read-only keychain / credential-file access.
 - `cache.py` — TTL'd on-disk snapshot cache plus `fetch_snapshots()`, the single read-through
   entry point both CLI modes use.
 - `config.py` — optional `~/.config/ai-usage-monitor/config.toml`. Not needed for Claude's
   primary path; holds fallback caps and the `use_oauth_usage_api` / `credentials_file` knobs.
 - `render.py` — shared rendering (rich panels + JSON) and the snapshot (de)serializer used by
-  both CLI modes and the cache, so snapshot and dashboard never drift apart. Also owns the v1
-  document: `snapshots_to_document()` and the `most_constrained()` precedence rules.
-- `cli.py` — `snapshot` (default, supports `--json` / `--fail-on-degraded`) and `dashboard`
-  (live, `rich.Live`) subcommands, plus `exit_code()`.
+  all CLI modes and the cache, so snapshot, dashboard, and doctor never drift apart. Also owns
+  the v1 document: `snapshots_to_document()` and the `most_constrained()` precedence rules.
+- `cli.py` — `snapshot` (default, supports `--json` / `--fail-on-degraded`), `doctor`
+  (per-source diagnostics), and `dashboard` (live, `rich.Live`) subcommands, plus `exit_code()`.

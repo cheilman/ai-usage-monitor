@@ -13,7 +13,8 @@ Once enabled, each `gemini_cli.api_response` event line carries input/output tok
 can sum over a trailing window. This is explicitly fragile: it depends on the user having
 opted in, on Google not changing the event schema, and on the outfile path staying put -- if
 the file is missing we report Confidence.UNAVAILABLE with instructions rather than pretending
-we have a number.
+we have a number. Every attempt to read it -- missing, present-but-empty, schema drift, or
+success -- records a SourceAttempt, which is what `ai-usage-monitor doctor` prints.
 
 Request caps (e.g. free-tier daily request limits) are not discoverable at all locally, so
 those come from `daily_request_limit` in config, sourced from gemini-cli's published quota
@@ -25,12 +26,24 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 from ai_usage_monitor.config import GeminiConfig
-from ai_usage_monitor.models import Confidence, ProviderSnapshot, UsageWindow
+from ai_usage_monitor.models import (
+    Confidence,
+    ProviderSnapshot,
+    SourceOutcome,
+    UsageWindow,
+)
+from ai_usage_monitor.providers.base import SourceResult, run_source
 
 API_RESPONSE_EVENT = "gemini_cli.api_response"
+
+TELEMETRY_SOURCE = "gemini-cli local telemetry log"
+
+ENABLE_TELEMETRY_HINT = (
+    'Enable local telemetry in ~/.gemini/settings.json: {"telemetry": {"enabled": true, '
+    '"target": "local", "outfile": "<path>"}}, then restart gemini-cli.'
+)
 
 
 @dataclass
@@ -46,17 +59,9 @@ def _parse_timestamp(raw: str) -> datetime | None:
         return None
 
 
-def _iter_events(log_path: Path) -> list[_Event]:
+def _parse_events(text: str) -> list[_Event]:
     events: list[_Event] = []
-    if not log_path.exists():
-        return events
-
-    try:
-        lines = log_path.read_text(errors="replace").splitlines()
-    except OSError:
-        return events
-
-    for line in lines:
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -83,6 +88,94 @@ def _iter_events(log_path: Path) -> list[_Event]:
     return events
 
 
+def _placeholder_window(config: GeminiConfig) -> UsageWindow:
+    """Shown when telemetry gives us nothing, so the cap is still visible next to a '-'."""
+    return UsageWindow(
+        key="daily_requests",
+        label="daily requests",
+        unit="requests",
+        used=None,
+        limit=float(config.daily_request_limit) if config.daily_request_limit else None,
+        reset_at=None,
+        confidence=Confidence.UNAVAILABLE,
+        source="gemini-cli local telemetry log (no data)",
+    )
+
+
+def _read_telemetry(config: GeminiConfig, now: datetime) -> SourceResult:
+    """Only source: gemini-cli's opt-in OpenTelemetry log."""
+    log_path = config.telemetry_log
+    if not log_path.exists():
+        return (
+            [_placeholder_window(config)],
+            SourceOutcome.NOT_FOUND,
+            f"{log_path} does not exist",
+            ENABLE_TELEMETRY_HINT,
+        )
+
+    try:
+        text = log_path.read_text(errors="replace")
+    except OSError as exc:
+        return (
+            [_placeholder_window(config)],
+            SourceOutcome.ERROR,
+            f"could not read {log_path}: {exc}",
+            "Check permissions on the telemetry log, or point gemini.telemetry_log at "
+            "the file gemini-cli is actually writing.",
+        )
+
+    events = _parse_events(text)
+    if not events:
+        line_count = len(text.splitlines())
+        return (
+            [_placeholder_window(config)],
+            SourceOutcome.EMPTY,
+            f"{log_path} has {line_count} line(s) but no usable "
+            f"{API_RESPONSE_EVENT} events",
+            ENABLE_TELEMETRY_HINT
+            if not line_count
+            else f"The log has content but no {API_RESPONSE_EVENT} events with token "
+            "counts -- gemini-cli's telemetry schema may have changed.",
+        )
+
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    todays_events = [e for e in events if e.timestamp >= day_start]
+    next_midnight = day_start + timedelta(days=1)
+
+    windows = [
+        UsageWindow(
+            key="daily_requests",
+            label="today's requests",
+            unit="requests",
+            used=float(len(todays_events)),
+            limit=float(config.daily_request_limit) if config.daily_request_limit else None,
+            reset_at=next_midnight,
+            confidence=Confidence.ESTIMATED,
+            source=TELEMETRY_SOURCE,
+            note="request cap sourced from published quota docs, not a live API",
+        ),
+        UsageWindow(
+            key="daily_tokens",
+            label="today's tokens",
+            unit="tokens",
+            used=float(sum(e.tokens for e in todays_events)),
+            limit=None,
+            reset_at=next_midnight,
+            confidence=Confidence.ESTIMATED,
+            source=TELEMETRY_SOURCE,
+            note="Google does not publish a token cap for this tier",
+        ),
+    ]
+
+    remediation = (
+        None
+        if config.daily_request_limit
+        else "Set gemini.daily_request_limit in config to get a percentage instead of '?'."
+    )
+    detail = f"{len(events)} event(s) in log, {len(todays_events)} today"
+    return windows, SourceOutcome.OK, detail, remediation
+
+
 class GeminiProvider:
     name = "gemini"
 
@@ -93,61 +186,14 @@ class GeminiProvider:
         now = datetime.now(UTC)
         snapshot = ProviderSnapshot(provider=self.name, fetched_at=now)
 
-        events = _iter_events(self.config.telemetry_log)
-        if not events:
+        windows, attempt = run_source(TELEMETRY_SOURCE, lambda: _read_telemetry(self.config, now))
+        snapshot.attempts.append(attempt)
+        snapshot.windows.extend(windows)
+
+        if not attempt.ok:
             snapshot.errors.append(
-                f"No Gemini CLI telemetry found at {self.config.telemetry_log}. Enable local "
-                'telemetry in ~/.gemini/settings.json: {"telemetry": {"enabled": true, '
-                '"target": "local", "outfile": "<path>"}}. Until then Gemini usage is unavailable.'
+                f"No Gemini usage available: {attempt.detail}. "
+                "Run `ai-usage-monitor doctor --provider gemini` for remediation steps."
             )
-            snapshot.windows.append(
-                UsageWindow(
-                    key="daily_requests",
-                    label="daily requests",
-                    unit="requests",
-                    used=None,
-                    limit=float(self.config.daily_request_limit)
-                    if self.config.daily_request_limit
-                    else None,
-                    reset_at=None,
-                    confidence=Confidence.UNAVAILABLE,
-                    source="gemini-cli local telemetry log (not found)",
-                )
-            )
-            return snapshot
-
-        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        todays_events = [e for e in events if e.timestamp >= day_start]
-        next_midnight = day_start + timedelta(days=1)
-
-        snapshot.windows.append(
-            UsageWindow(
-                key="daily_requests",
-                label="today's requests",
-                unit="requests",
-                used=float(len(todays_events)),
-                limit=float(self.config.daily_request_limit)
-                if self.config.daily_request_limit
-                else None,
-                reset_at=next_midnight,
-                confidence=Confidence.ESTIMATED,
-                source="gemini-cli local telemetry log",
-                note="request cap sourced from published quota docs, not a live API",
-            )
-        )
-
-        snapshot.windows.append(
-            UsageWindow(
-                key="daily_tokens",
-                label="today's tokens",
-                unit="tokens",
-                used=float(sum(e.tokens for e in todays_events)),
-                limit=None,
-                reset_at=next_midnight,
-                confidence=Confidence.ESTIMATED,
-                source="gemini-cli local telemetry log",
-                note="Google does not publish a token cap for this tier",
-            )
-        )
 
         return snapshot
