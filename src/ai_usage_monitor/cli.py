@@ -9,6 +9,7 @@ from rich.columns import Columns
 from rich.console import Console
 from rich.live import Live
 
+from ai_usage_monitor.cache import DEFAULT_MAX_AGE, SnapshotCache, fetch_snapshots
 from ai_usage_monitor.config import load_config
 from ai_usage_monitor.models import ProviderSnapshot, ProviderStatus
 from ai_usage_monitor.providers import ALL_PROVIDERS
@@ -18,6 +19,8 @@ from ai_usage_monitor.render import render_snapshot_panel, snapshots_to_document
 # gate on `ai-usage-monitor --json` without parsing anything.
 EXIT_OK = 0
 EXIT_NO_USABLE_DATA = 2
+
+DEFAULT_INTERVAL = 30.0
 
 
 def _build_providers(names: list[str]):
@@ -34,6 +37,11 @@ def _resolve_provider_names(selected: str) -> list[str]:
     if selected == "all":
         return list(ALL_PROVIDERS)
     return [selected]
+
+
+def _cache_for(args: argparse.Namespace) -> SnapshotCache | None:
+    """None means "don't touch the cache at all" -- neither read nor write."""
+    return None if args.no_cache else SnapshotCache()
 
 
 def exit_code(snapshots: list[ProviderSnapshot], fail_on_degraded: bool = False) -> int:
@@ -53,7 +61,7 @@ def exit_code(snapshots: list[ProviderSnapshot], fail_on_degraded: bool = False)
 def cmd_snapshot(args: argparse.Namespace) -> int:
     names = _resolve_provider_names(args.provider)
     providers = _build_providers(names)
-    snapshots = [p.fetch() for p in providers]
+    snapshots = fetch_snapshots(providers, cache=_cache_for(args), max_age=args.max_age)
     code = exit_code(snapshots, getattr(args, "fail_on_degraded", False))
 
     if args.json:
@@ -73,10 +81,13 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
 def cmd_dashboard(args: argparse.Namespace) -> int:
     names = _resolve_provider_names(args.provider)
     providers = _build_providers(names)
+    cache = _cache_for(args)
     console = Console()
 
     def render():
-        snapshots = [p.fetch() for p in providers]
+        # Read-through cache: with the default 30s interval and 60s max-age we hit the
+        # providers every other tick, and the panel subtitle shows the real data age.
+        snapshots = fetch_snapshots(providers, cache=cache, max_age=args.max_age)
         panels = [render_snapshot_panel(s) for s in snapshots]
         return Columns(panels, equal=True, expand=True)
 
@@ -88,6 +99,22 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     return 0
+
+
+def _add_cache_args(target: argparse.ArgumentParser) -> None:
+    target.add_argument(
+        "--max-age",
+        type=float,
+        default=DEFAULT_MAX_AGE,
+        metavar="S",
+        help="reuse a cached snapshot up to S seconds old (0 = always fetch live; default: "
+        f"{DEFAULT_MAX_AGE:g})",
+    )
+    target.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="ignore the on-disk cache entirely, and don't write to it",
+    )
 
 
 def _add_snapshot_args(parser: argparse.ArgumentParser) -> None:
@@ -103,6 +130,7 @@ def _add_snapshot_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help=f"exit {EXIT_NO_USABLE_DATA} unless every provider is ok, not just one",
     )
+    _add_cache_args(parser)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -123,11 +151,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     dashboard_parser = subparsers.add_parser("dashboard", help="live-updating terminal dashboard")
     dashboard_parser.add_argument(
-        "--interval", type=float, default=5.0, help="refresh interval in seconds"
+        "--interval",
+        type=float,
+        default=DEFAULT_INTERVAL,
+        help=f"refresh interval in seconds (default: {DEFAULT_INTERVAL:g})",
     )
     dashboard_parser.add_argument(
         "--provider", choices=["all", *ALL_PROVIDERS], default="all"
     )
+    _add_cache_args(dashboard_parser)
     dashboard_parser.set_defaults(func=cmd_dashboard)
 
     # Bare `ai-usage-monitor` with no subcommand behaves like `snapshot`.
