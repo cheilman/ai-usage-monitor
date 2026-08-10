@@ -1,0 +1,49 @@
+{
+  "_comment": "Golden fixture: real GET https://api.anthropic.com/api/oauth/usage response shape, captured live during the K-000076 design phase (2026-08-01) with account-specific values scrubbed. If Anthropic changes this shape, the parser tests fail loudly instead of the CLI printing a silently wrong number.",
+  "plan": "pro",
+  "five_hour": {
+    "utilization": 21.0,
+    "resets_at": "2026-08-02T07:20:00.628697+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day": {
+    "utilization": 54.0,
+    "resets_at": "2026-08-03T00:00:00.628717+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day_opus": null,
+  "seven_day_sonnet": null,
+  "extra_usage": {
+    "is_enabled": false,
+    "used_credits": 0.0,
+    "currency": "USD",
+    "monthly_limit_credits": null
+  },
+  "limits": [
+    {
+      "kind": "session",
+      "group": "session",
+      "percent": 21,
+      "severity": "normal",
+      "resets_at": "2026-08-02T07:20:00.628697+00:00",
+      "is_active": false
+    },
+    {
+      "kind": "weekly_all",
+      "group": "weekly",
+      "percent": 54,
+      "severity": "normal",
+      "resets_at": "2026-08-03T00:00:00.628717+00:00",
+      "is_active": true
+    }
+  ],
+  "spend": {
+    "used": { "amount_minor": 0, "currency": "USD", "exponent": 2 },
+    "limit": null
+  },
+  "member_dashboard_available": false
+}

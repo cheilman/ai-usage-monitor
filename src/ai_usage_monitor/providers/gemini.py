@@ -91,6 +91,7 @@ def _parse_events(text: str) -> list[_Event]:
 def _placeholder_window(config: GeminiConfig) -> UsageWindow:
     """Shown when telemetry gives us nothing, so the cap is still visible next to a '-'."""
     return UsageWindow(
+        key="daily_requests",
         label="daily requests",
         unit="requests",
         used=None,
@@ -143,6 +144,7 @@ def _read_telemetry(config: GeminiConfig, now: datetime) -> SourceResult:
 
     windows = [
         UsageWindow(
+            key="daily_requests",
             label="today's requests",
             unit="requests",
             used=float(len(todays_events)),
@@ -153,6 +155,7 @@ def _read_telemetry(config: GeminiConfig, now: datetime) -> SourceResult:
             note="request cap sourced from published quota docs, not a live API",
         ),
         UsageWindow(
+            key="daily_tokens",
             label="today's tokens",
             unit="tokens",
             used=float(sum(e.tokens for e in todays_events)),
