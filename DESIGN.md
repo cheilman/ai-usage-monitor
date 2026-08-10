@@ -83,6 +83,12 @@ needed.
   label, so a revoked or misconfigured key can't hide the others — `doctor` says exactly which
   key failed and why. No keys configured at all reports `no_credential` with the `export`
   needed, rather than silently omitting the provider.
+- `_discover_openrouter_keys` also falls back to `$KITENG_HOME/.env` (default `~/.kiteng/.env`)
+  for any `OPENROUTER_API_KEY*` name not already in `os.environ` — the same file kiteng's own
+  `load_env_file()` reads to provision secrets for agent subprocesses (launchd/cron, no shell
+  `export` in scope). It's a fallback only: a name already set in the process environment is
+  never overridden by the file, matching that file's own documented purpose. A missing or
+  unreadable file just means no fallback values, never an error.
 
 ## Fragility, called out explicitly
 

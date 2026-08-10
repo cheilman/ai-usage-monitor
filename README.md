@@ -268,6 +268,11 @@ export OPENROUTER_API_KEY_WORK=sk-or-...         # -> reported as "work"
 Set none and the provider reports `unavailable` with instructions; set several and each gets
 its own row and its own `doctor` attempt, so one bad key can't hide the others.
 
+If a name isn't already set in the process environment, `$KITENG_HOME/.env` (default
+`~/.kiteng/.env`) is read as a fallback — the same file kiteng itself uses to provision
+secrets for agent subprocesses. Anything already exported in your shell still wins; the file
+is only consulted for names that are otherwise unset.
+
 ## Development
 
 ```sh

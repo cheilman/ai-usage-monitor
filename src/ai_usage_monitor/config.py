@@ -68,6 +68,46 @@ class Config:
 _OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
 
 
+def _parse_env_file(text: str) -> dict[str, str]:
+    """Minimal KEY=VALUE parser: blank lines, `#` comments, optional quotes on the value.
+
+    Matches the format kiteng.config.load_env_file() itself writes/reads -- not a full
+    dotenv implementation (no export keyword, no variable expansion), just enough to read
+    that one file.
+    """
+    result: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key:
+            result[key] = value
+    return result
+
+
+def _load_kiteng_env_file() -> dict[str, str]:
+    """Fallback source for OPENROUTER_API_KEY*: `$KITENG_HOME/.env` (default ~/.kiteng/.env).
+
+    This is the same file kiteng.config.load_env_file() reads to provision secrets for
+    agent subprocesses when keychain/session auth isn't available (e.g. launchd/cron). We
+    read it too, as a *fallback only* -- a name already set in this process's own
+    environment always wins, mirroring that file's own stated purpose. Missing file or
+    unreadable file just means no fallback values, never an error.
+    """
+    kiteng_home = Path(os.environ.get("KITENG_HOME", "~/.kiteng")).expanduser()
+    env_file = kiteng_home / ".env"
+    try:
+        text = env_file.read_text()
+    except OSError:
+        return {}
+    return _parse_env_file(text)
+
+
 def _discover_openrouter_keys() -> list[OpenRouterKeyConfig]:
     """One key per matching env var: `OPENROUTER_API_KEY` -> label "default",
     `OPENROUTER_API_KEY_<LABEL>` -> label "<label>" (lowercased, underscores as hyphens).
@@ -76,18 +116,23 @@ def _discover_openrouter_keys() -> list[OpenRouterKeyConfig]:
     second or third key (a work account, a CI token, ...) is one `export` away rather than
     a config-file edit: `export OPENROUTER_API_KEY_WORK=sk-or-...` is enough to add a row.
     Sorted by label so the reported order is deterministic across runs.
+
+    Falls back to `~/.kiteng/.env` for names not already in this process's environment, so
+    a key provisioned there for agent subprocesses is picked up here too without needing a
+    separate `export`.
     """
+    env = {**_load_kiteng_env_file(), **os.environ}
     keys: list[OpenRouterKeyConfig] = []
 
-    default_key = os.environ.get(_OPENROUTER_KEY_ENV)
+    default_key = env.get(_OPENROUTER_KEY_ENV)
     if default_key:
         keys.append(OpenRouterKeyConfig(label="default", api_key=default_key))
 
     prefix = f"{_OPENROUTER_KEY_ENV}_"
-    for name in sorted(os.environ):
+    for name in sorted(env):
         if not name.startswith(prefix):
             continue
-        value = os.environ.get(name)
+        value = env.get(name)
         if not value:
             continue
         label = name[len(prefix) :].lower().replace("_", "-")
@@ -164,4 +209,6 @@ daily_request_limit = 1000        # public free-tier default; change for paid ti
 #   export OPENROUTER_API_KEY_WORK=sk-or-...        # -> reported as "work"
 # Every OPENROUTER_API_KEY / OPENROUTER_API_KEY_<LABEL> variable that's set becomes one
 # row; set none and the provider just reports "unavailable".
+# If a name isn't set in the environment, $KITENG_HOME/.env (default ~/.kiteng/.env) is
+# read as a fallback -- the same file kiteng itself uses to provision agent subprocesses.
 """
