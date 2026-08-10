@@ -26,6 +26,7 @@ class FakeProvider:
             fetched_at=datetime.now(UTC),
             windows=[
                 UsageWindow(
+                    key="five_hour",
                     label="5h session tokens",
                     unit="tokens",
                     used=self.used * self.calls,
@@ -190,7 +191,8 @@ def test_cache_file_contains_no_credentials(monkeypatch, tmp_path):
     monkeypatch.setattr(
         claude_module,
         "_probe_live_api_limits",
-        lambda now: UsageWindow(
+        lambda: UsageWindow(
+            key="api_tokens_per_minute",
             label="API tokens/min (live key)",
             unit="tokens",
             used=10.0,
@@ -213,9 +215,18 @@ def test_cache_file_contains_no_credentials(monkeypatch, tmp_path):
     # Belt and braces: the serialized schema is a closed set of known-safe keys.
     entry = json.loads(written)["entries"]["claude"]
     assert set(entry) == {"cached_at", "snapshot"}
-    assert set(entry["snapshot"]) == {"provider", "fetched_at", "windows", "errors"}
+    assert set(entry["snapshot"]) == {
+        "provider",
+        "status",
+        "fetched_at",
+        "plan",
+        "windows",
+        "notes",
+        "errors",
+    }
     for window in entry["snapshot"]["windows"]:
         assert set(window) == {
+            "key",
             "label",
             "unit",
             "used",
@@ -225,14 +236,32 @@ def test_cache_file_contains_no_credentials(monkeypatch, tmp_path):
             "confidence",
             "source",
             "note",
+            "is_active",
+            "severity",
         }
 
 
+# Both sources pointed at nothing, so the run is hermetic: no keychain, no network, no
+# dependence on whether the developer's own machine happens to have usage data lying around
+# (mirrors tests/test_cli.py's OFFLINE_CONFIG, so a live 429 or a stale local login can't
+# make the exit code -- and therefore these cache-behavior assertions -- flaky).
+_OFFLINE_CONFIG = """\
+[claude]
+use_oauth_usage_api = false
+
+[gemini]
+telemetry_log = "{telemetry_log}"
+"""
+
+
 def _run_cli(args, cache_path: Path, tmp_path: Path):
+    config = tmp_path / "config.toml"
+    config.write_text(_OFFLINE_CONFIG.format(telemetry_log=tmp_path / "no-telemetry.log"))
     env = {
         **os.environ,
         "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-home"),
-        "AI_USAGE_MONITOR_CONFIG": str(tmp_path / "no-config.toml"),
+        "AI_USAGE_MONITOR_CONFIG": str(config),
+        "CLAUDE_CREDENTIALS_FILE": str(tmp_path / "no-credentials.json"),
         "AI_USAGE_MONITOR_CACHE": str(cache_path),
     }
     env.pop("ANTHROPIC_API_KEY", None)  # keep the CLI offline
@@ -249,13 +278,14 @@ def test_cli_snapshot_writes_then_reads_cache(tmp_path):
     cache_path = tmp_path / "cache" / "snapshot.json"
 
     first = _run_cli(["snapshot", "--json"], cache_path, tmp_path)
-    assert first.returncode == 0, first.stderr
+    assert first.returncode == 2, first.stderr
     assert cache_path.exists()
 
     second = _run_cli(["snapshot", "--json"], cache_path, tmp_path)
-    assert second.returncode == 0, second.stderr
+    assert second.returncode == 2, second.stderr
     # Same fetched_at across two processes => the second one served from cache.
-    assert json.loads(second.stdout) == json.loads(first.stdout)
+    # (`generated_at` is stamped fresh on every call, so compare providers, not the envelope.)
+    assert json.loads(second.stdout)["providers"] == json.loads(first.stdout)["providers"]
 
 
 def test_cli_no_cache_bypasses_a_warm_entry(tmp_path):
@@ -268,7 +298,7 @@ def test_cli_no_cache_bypasses_a_warm_entry(tmp_path):
 
     result = _run_cli(["snapshot", "--json", "--no-cache"], cache_path, tmp_path)
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 2, result.stderr
     assert "STALE-SENTINEL" not in result.stdout
     assert cache_path.read_text() == before  # --no-cache doesn't write either
 
@@ -282,7 +312,7 @@ def test_cli_max_age_zero_forces_live_fetch(tmp_path):
 
     result = _run_cli(["snapshot", "--json", "--max-age", "0"], cache_path, tmp_path)
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 2, result.stderr
     assert "STALE-SENTINEL" not in result.stdout
     # Unlike --no-cache, a live fetch here still refreshes the cache for the next reader.
     assert "STALE-SENTINEL" not in cache_path.read_text()
@@ -294,5 +324,6 @@ def test_cli_survives_a_corrupt_cache_file(tmp_path):
 
     result = _run_cli(["snapshot", "--json"], cache_path, tmp_path)
 
-    assert result.returncode == 0, result.stderr
-    assert {entry["provider"] for entry in json.loads(result.stdout)} == {"claude", "gemini"}
+    assert result.returncode == 2, result.stderr
+    providers = json.loads(result.stdout)["providers"]
+    assert {entry["provider"] for entry in providers} == {"claude", "gemini"}
