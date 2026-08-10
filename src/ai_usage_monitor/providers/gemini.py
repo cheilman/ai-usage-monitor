@@ -102,6 +102,7 @@ class GeminiProvider:
             )
             snapshot.windows.append(
                 UsageWindow(
+                    key="daily_requests",
                     label="daily requests",
                     unit="requests",
                     used=None,
@@ -121,6 +122,7 @@ class GeminiProvider:
 
         snapshot.windows.append(
             UsageWindow(
+                key="daily_requests",
                 label="today's requests",
                 unit="requests",
                 used=float(len(todays_events)),
@@ -136,6 +138,7 @@ class GeminiProvider:
 
         snapshot.windows.append(
             UsageWindow(
+                key="daily_tokens",
                 label="today's tokens",
                 unit="tokens",
                 used=float(sum(e.tokens for e in todays_events)),

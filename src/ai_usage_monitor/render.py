@@ -12,6 +12,17 @@ from rich.text import Text
 
 from ai_usage_monitor.models import Confidence, ProviderSnapshot, UsageWindow
 
+# Bumped only when the --json document shape changes incompatibly. Consumers should refuse
+# to parse a schema_version they don't recognize rather than guess at the fields.
+SCHEMA_VERSION = 1
+
+# Tie-break for most_constrained: at equal utilization, trust the better-sourced number.
+_CONFIDENCE_RANK = {
+    Confidence.AUTHORITATIVE.value: 0,
+    Confidence.ESTIMATED.value: 1,
+    Confidence.UNAVAILABLE.value: 2,
+}
+
 _PROVIDER_STYLE = {
     "claude": "#d97757",
     "gemini": "#4285f4",
@@ -128,13 +139,21 @@ def render_snapshot_panel(snapshot: ProviderSnapshot, now: datetime | None = Non
     )
 
 
-def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict:
-    return {
-        "provider": snapshot.provider,
-        "fetched_at": snapshot.fetched_at.isoformat(),
-        "plan": snapshot.plan,
-        "windows": [
+def _window_dicts(snapshot: ProviderSnapshot) -> list[dict]:
+    """Serialize one provider's windows, guaranteeing `key` is unique within the provider.
+
+    Providers assign keys from a fixed table, but a payload could in principle report the
+    same kind twice. Suffixing a repeat (`weekly_all_2`) keeps `key` usable as an index
+    instead of silently giving a consumer two different rows under one name.
+    """
+    seen: dict[str, int] = {}
+    dicts: list[dict] = []
+    for w in snapshot.windows:
+        count = seen.get(w.key, 0) + 1
+        seen[w.key] = count
+        dicts.append(
             {
+                "key": w.key if count == 1 else f"{w.key}_{count}",
                 "label": w.label,
                 "unit": w.unit,
                 "used": w.used,
@@ -147,8 +166,71 @@ def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict:
                 "is_active": w.is_active,
                 "severity": w.severity,
             }
-            for w in snapshot.windows
-        ],
+        )
+    return dicts
+
+
+def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict:
+    return {
+        "provider": snapshot.provider,
+        "status": snapshot.status.value,
+        "fetched_at": snapshot.fetched_at.isoformat(),
+        "plan": snapshot.plan,
+        "windows": _window_dicts(snapshot),
         "notes": snapshot.notes,
         "errors": snapshot.errors,
+    }
+
+
+def most_constrained(providers: list[dict]) -> dict | None:
+    """The window closest to its cap across every provider, or None if nothing is known.
+
+    This exists so the throttling consumer is a single lookup instead of a re-implementation
+    of our precedence rules. Precedence: highest utilization wins; ties go to the better
+    confidence, then to provider/key alphabetically so the answer is deterministic.
+
+    `None` means **quota is unknown**, not "quota is available" -- a consumer must treat it
+    as a reason to back off or to ask another way, never as a green light.
+
+    Takes already-serialized provider dicts so the `key` it reports is exactly the one the
+    caller can find under `providers[].windows[]`, suffixing and all.
+    """
+    candidates = [
+        (provider["provider"], window)
+        for provider in providers
+        for window in provider["windows"]
+        if window["percent"] is not None
+        and window["confidence"] != Confidence.UNAVAILABLE.value
+    ]
+    if not candidates:
+        return None
+
+    provider_name, window = min(
+        candidates,
+        key=lambda c: (
+            -c[1]["percent"],
+            _CONFIDENCE_RANK.get(c[1]["confidence"], len(_CONFIDENCE_RANK)),
+            c[0],
+            c[1]["key"],
+        ),
+    )
+    return {
+        "provider": provider_name,
+        "key": window["key"],
+        "label": window["label"],
+        "utilization_pct": window["percent"],
+        "resets_at": window["reset_at"],
+    }
+
+
+def snapshots_to_document(
+    snapshots: list[ProviderSnapshot], generated_at: datetime | None = None
+) -> dict:
+    """Build the versioned `--json` document (schema_version 1). The stable contract."""
+    providers = [snapshot_to_dict(s) for s in snapshots]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": (generated_at or datetime.now(UTC)).isoformat(),
+        "providers": providers,
+        "most_constrained": most_constrained(providers),
     }

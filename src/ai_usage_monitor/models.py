@@ -18,10 +18,25 @@ class Confidence(str, Enum):
     UNAVAILABLE = "unavailable"
 
 
+class ProviderStatus(str, Enum):
+    """Roll-up of one provider's snapshot, and the input to the process exit code."""
+
+    # At least one authoritative window and no failure anywhere in the source chain.
+    OK = "ok"
+    # We have usable numbers, but they came from a fallback or a driftable estimate.
+    DEGRADED = "degraded"
+    # No usable window at all -- quota is *unknown*, which is not the same as available.
+    UNAVAILABLE = "unavailable"
+
+
 @dataclass
 class UsageWindow:
     """One usage/limit pair, e.g. "5-hour session tokens" or "requests per minute"."""
 
+    # Stable machine identifier (`five_hour`, `weekly_all`, ...). Part of the --json v1
+    # contract: consumers match on this, never on `label`, which is display prose and free
+    # to change. Unique within a provider -- render.py suffixes any collision.
+    key: str
     label: str
     unit: str
     used: float | None
@@ -56,3 +71,20 @@ class ProviderSnapshot:
     plan: str | None = None
     # Non-error side facts worth showing, e.g. extra-usage credits or period spend.
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def status(self) -> ProviderStatus:
+        """Confidence + errors rolled up per the design's exit-code rules.
+
+        A recorded error means some source in the chain failed, so whatever we're showing is
+        a fallback -- never OK, even if a *different* window (e.g. the API-key rate limit
+        headers, which measure something else entirely) happens to be authoritative.
+        """
+        usable = [w for w in self.windows if w.confidence is not Confidence.UNAVAILABLE]
+        if not usable:
+            return ProviderStatus.UNAVAILABLE
+        if self.errors:
+            return ProviderStatus.DEGRADED
+        if any(w.confidence is Confidence.AUTHORITATIVE for w in usable):
+            return ProviderStatus.OK
+        return ProviderStatus.DEGRADED
